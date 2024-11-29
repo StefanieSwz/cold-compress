@@ -46,6 +46,7 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         "l2",
         "hybrid",
         "keep_it_odd",
+        "lightweight",
     ]
     debug_strategies = [f"debug_{strategy}" for strategy in strategies]
     strategies.extend(debug_strategies)
@@ -150,6 +151,94 @@ def create_window_attention_mask(seq_len, window_size, device, global_tokens: in
 
 
 class KVCache(ABC, nn.Module):
+    """
+    The `KVCache` class is designed as a **Key-Value Cache** implementation for transformer-based models, commonly used in tasks such as autoregressive text generation. In transformers, a KV cache stores the intermediate Key (K) and Value (V) representations from previous tokens, allowing efficient reuse during subsequent inference steps without recomputing attention for the entire input sequence.
+
+    Here’s an analysis of its components and purpose:
+
+    ---
+
+    ### **Purpose**
+    1. **Caching Key-Value Representations**:
+    - The KV cache allows transformers to efficiently handle long sequences by storing previously computed Key (K) and Value (V) representations.
+    - This reduces redundant computations when processing autoregressive models like GPT for tasks such as language modeling or text generation.
+
+    2. **Quantization for Memory Efficiency**:
+    - The class supports quantization (2, 4, or 8 bits) to compress the cache, enabling memory savings, which is crucial for handling large models and long sequences.
+
+    3. **Support for Head-Specific and Variable-Length Caches**:
+    - It includes advanced features like "head-specific" cache evictions (allowing each attention head to manage its own tokens differently) and variable-length caching (where the number of cached tokens can vary per head or sequence).
+
+    ---
+
+    ### **Components**
+    #### 1. **Initialization**
+    - **Inputs**:
+        - `max_batch_size`, `n_heads`, `head_dim`: Define the dimensions of the cache.
+        - `dtype`: Specifies the data type for the cache (e.g., `torch.bfloat16` for reduced precision).
+        - `head_specific` and `variable_length`: Enable advanced cache management options for different heads or variable token counts.
+    - **Cache Shape**:
+        - The `cache_shape` attribute defines the memory layout: `(batch_size, n_heads, max_cache_length, head_dim)`.
+
+    ---
+
+    #### 2. **Quantization Support**
+    - If quantization (`cache_bits`) is enabled, the cache tensors (`k_cache` and `v_cache`) are quantized using a `quantize_tensor` function. This reduces the memory footprint of the cache by using fewer bits per value.
+    - Additional buffers like `k_scales` and `v_zeros` store quantization parameters for decompressing the cache when needed.
+
+    ---
+
+    #### 3. **Position Tracking (`pos`)**
+    - Tracks the original positions of tokens in the cache for later reference. This is critical for tasks like cache eviction, where tokens need to be removed based on their position or age.
+
+    ---
+
+    #### 4. **Masking Support (`mask`)**
+    - A mask is used to indicate which cache entries are valid. This is necessary when the number of tokens varies across heads or sequences due to "variable_length" mode.
+
+    ---
+
+    #### 5. **Cache Count (`cache_cts`)**
+    - Tracks how many tokens are stored in the cache for each head or globally, depending on whether `variable_length` is enabled.
+
+    ---
+
+    ### **What the Class Enables**
+    1. **Efficient Inference**:
+    - Reuses previous KV representations during autoregressive decoding, reducing computation time.
+
+    2. **Memory Efficiency**:
+    - Supports quantization to reduce memory usage, enabling larger models or longer sequences to fit into limited GPU memory.
+
+    3. **Advanced Cache Management**:
+    - Enables features like head-specific caching, variable-length caching, and custom eviction strategies for handling edge cases in dynamic sequence processing.
+
+    ---
+
+    ### **Example Use Case**
+    In an autoregressive text generation task (e.g., using GPT):
+    1. **Initialization**: A `KVCache` is instantiated with dimensions based on the model's attention heads and embedding size.
+    2. **Token Caching**:
+    - When a token is processed, its key and value representations are computed and stored in the cache.
+    3. **Efficient Decoding**:
+    - For the next token, the model retrieves previously cached keys and values, avoiding recomputation.
+    4. **Quantization**:
+    - If enabled, the cache is stored in a quantized format to save memory.
+
+    ---
+
+    ### **Advanced Features**
+    1. **Custom Cache Eviction**:
+    - By using `pos` and `mask`, tokens can be evicted selectively (e.g., least recently used or low-importance tokens).
+
+    2. **Dynamic Cache Adaptation**:
+    - Variable-length and head-specific caching allow for flexible memory allocation, useful in adaptive models.
+
+    ---
+
+    In summary, the `KVCache` class is a sophisticated module for managing memory-efficient caching in transformers, with support for advanced features like quantization and custom caching policies. It is designed to optimize inference time and memory usage, especially for long-context or resource-constrained environments.
+    """
+
     # Define which hyperparameters are relevant for the cache.
     # Override as needed for sub-classes.
     relevant_kwargs = [
@@ -438,6 +527,106 @@ class KVCacheHeadConstant(KVCache):
 
 
 class KVCacheHeadSpecific(KVCache):
+    """
+    The `KVCacheHeadSpecific` class extends the `KVCache` class to implement **head-specific caching** for transformer models. This allows each attention head to manage its own key-value (KV) cache independently, including separate cache updates, token insertion, and eviction strategies.
+
+    Here's a detailed breakdown of the class and its `_fill` method:
+
+    ---
+
+    ### **Purpose of `KVCacheHeadSpecific`**
+    1. **Head-Specific Cache Management**:
+    - In transformers, attention heads often share the same KV cache. However, there are scenarios where allowing each head to independently manage its cache can improve flexibility and performance:
+        - **Token Importance**: Some heads may focus on more critical tokens, while others focus on less important context.
+        - **Dynamic Memory Allocation**: Each head can determine how to allocate its cache slots based on its specific attention patterns.
+
+    2. **Efficient Cache Updates**:
+    - The `_fill` method is designed to efficiently update specific slots in the KV cache with new key-value pairs. This is particularly useful for tasks like autoregressive generation, where new tokens are added one at a time.
+
+    ---
+
+    ### **Key Features**
+    1. **Independent Cache for Heads**:
+    - Each head can have its own cache state (`pos`, `k_cache`, `v_cache`, and `mask`), as opposed to sharing a global cache across all heads.
+    - `head_specific=True` is passed to the parent class (`KVCache`), enabling this behavior.
+
+    2. **Supports Variable Length Caching**:
+    - By enabling `variable_length=True`, the number of tokens stored in the cache can vary across heads.
+
+    3. **In-Place Updates**:
+    - The `_fill` method modifies the cache directly in-place to efficiently handle updates without creating additional memory overhead.
+
+    ---
+
+    ### **Components of `_fill`**
+    The `_fill` method is responsible for updating the cache with new key-value pairs for specific positions.
+
+    #### **Arguments**
+    - **`fill_idxs`**: Specifies the cache indices to update. It can be a tensor or an integer.
+    - **`input_pos`**: The original positions of the tokens being added to the cache.
+    - **`k_val` and `v_val`**: The key and value tensors to store in the cache.
+    - **`update_mask`**: Optional; determines whether to update the mask (`True` by default).
+
+    #### **Logic**
+    1. **Shape Assertions**:
+    - Ensures `input_pos`, `k_val`, and `v_val` have compatible dimensions, as they must correspond to the sequence length and cache size.
+
+    2. **Position Updates** (`self.pos`):
+    - The `input_pos` tensor, which specifies the original positions of tokens, is written into the `pos` buffer using `scatter_`.
+    - `scatter_` allows in-place updates at specific indices defined by `fill_idxs`.
+
+    3. **Key-Value Updates** (`self.k_cache`, `self.v_cache`):
+    - `k_val` and `v_val` (new key-value pairs) are written into the key (`k_cache`) and value (`v_cache`) caches at positions defined by `fill_idxs`.
+
+    4. **Mask Updates** (`self.mask`):
+    - If `update_mask=True`, the cache mask is updated to reflect that new tokens have been added at the specified positions. This mask is used later to indicate which cache slots are valid during attention computations.
+
+    ---
+
+    ### **Use Case**
+    This class is particularly useful for scenarios where attention heads need to manage their token representations independently, such as:
+    1. **Selective Attention**:
+    - Some heads may prioritize certain tokens over others (e.g., based on token importance scores or positional relevance).
+    2. **Dynamic Token Insertion**:
+    - In autoregressive models, new tokens are added to the cache incrementally. This method ensures efficient updates.
+    3. **Memory Optimization**:
+    - Each head can have its own cache size or eviction policy, allowing for fine-grained control over memory usage.
+
+    ---
+
+    ### **Example Workflow**
+    #### **Initialization**
+    ```python
+    cache = KVCacheHeadSpecific(
+        max_batch_size=16,
+        n_heads=8,
+        head_dim=64,
+        dtype=torch.float32,
+        variable_length=True
+    )
+    ```
+
+    #### **Filling the Cache**
+    ```python
+    # Assume batch_size=1, n_heads=8, seq_len=10, head_dim=64
+    k_val = torch.rand(1, 8, 10, 64)  # New key values
+    v_val = torch.rand(1, 8, 10, 64)  # New value values
+    input_pos = torch.arange(10)  # Token positions
+    fill_indices = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])  # Cache slots to fill
+
+    cache._fill(input_pos=input_pos, k_val=k_val, v_val=v_val, fill_idxs=fill_indices)
+    ```
+
+    #### **Effect**
+    - Updates specific slots in the `k_cache`, `v_cache`, and `pos` buffers with new token representations.
+    - Updates the `mask` buffer to mark the filled slots as valid.
+
+    ---
+
+    ### **Summary**
+    The `KVCacheHeadSpecific` class extends `KVCache` to support **independent management of KV caches for each attention head**. The `_fill` method efficiently updates the cache with new key-value pairs, maintaining position information and validity masks. This flexibility is valuable for optimizing memory and attention computations in transformer-based models, particularly for tasks with dynamic or selective attention needs.
+    """
+
     def __init__(
         self,
         max_batch_size,
@@ -612,6 +801,209 @@ class KVCacheL2(KVCacheHeadSpecific):
             self.key_norm.copy_(torch.linalg.vector_norm(self.k_cache, ord=2, dim=-1))
 
 
+"""
+### **Given Information**
+1. **Cache Shape**:
+   ```python
+   self.cache_shape = (max_batch_size, n_heads, self.max_cache_length, head_dim)
+   ```
+   - `max_batch_size`: Number of sequences in a batch.
+   - `n_heads`: Number of attention heads.
+   - `max_cache_length`: Maximum number of tokens that can be stored in the cache for each head.
+   - `head_dim`: Dimensionality of the key/value vectors for each head.
+
+   This implies that:
+   - The key-value cache (`k_cache`, `v_cache`) has independent storage for each head.
+
+2. **Key/Value Cache**:
+   ```python
+   k_cache = torch.zeros(self.cache_shape, dtype=dtype)
+   v_cache = torch.zeros(self.cache_shape, dtype=dtype)
+   ```
+   - The key (`k_cache`) and value (`v_cache`) caches are correctly initialized with the shape:
+     - `(max_batch_size, n_heads, max_cache_length, head_dim)`
+
+3. **Position Tracking**:
+   - `pos` is used to track the positions of tokens in the cache.
+   - If `head_specific=True`:
+     - `pos` has a shape of `(max_batch_size, n_heads, max_cache_length)`.
+     - Each head independently tracks the positions of tokens in its cache.
+   - If `head_specific=False`:
+     - `pos` has a shape of `(max_batch_size, 1, max_cache_length)`.
+     - All heads share the same position information.
+
+---
+
+### **Head-Specific Caching**
+For **head-specific caching** (`head_specific=True`), the following assumptions hold:
+1. Each head operates on its own slice of the cache:
+   - `k_cache[:, head_idx, :, :]` and `v_cache[:, head_idx, :, :]` store the key/value vectors for head `head_idx`.
+2. Each head tracks its own positions using:
+   - `pos[:, head_idx, :]`.
+
+**Implication**: The dimensions of `pos` and `k_cache/v_cache` should match in the first three dimensions (`max_batch_size`, `n_heads`, `max_cache_length`).
+"""
+
+
+class KVCacheLightweight(KVCacheHeadSpecific):
+    relevant_kwargs = [
+        "max_cache_length",
+        "max_seq_length",
+        "cache_bits",
+        "global_tokens",
+        "recent_window",
+    ]
+
+    def __init__(
+        self,
+        max_batch_size,
+        n_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        model_type="linear",  # Type of lightweight model: "linear" or "mlp"
+        **kwargs,
+    ):
+        super().__init__(max_batch_size, n_heads, head_dim, dtype, **kwargs)
+
+        # Initialize per-head lightweight models
+        if model_type == "linear":
+            self.models = nn.ModuleList(
+                [
+                    nn.Linear(3, 1)
+                    for _ in range(
+                        n_heads
+                    )  # Input features: key_norm, value_norm, attention score
+                ]
+            )
+        elif model_type == "mlp":
+            self.models = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(3, 16),  # Input features
+                        nn.ReLU(),
+                        nn.Linear(16, 1),
+                    )
+                    for _ in range(n_heads)
+                ]
+            )
+        else:
+            raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
+
+        # getting the key buffer, as key norm is a feature
+        key_norm_shape = (max_batch_size, n_heads, self.max_cache_length)
+        self.register_buffer("key_norm", torch.zeros(key_norm_shape, dtype=dtype))
+        # getting the value buffer, as value norm is a feature
+        value_norm_shape = (max_batch_size, n_heads, self.max_cache_length)
+        self.register_buffer("value_norm", torch.zeros(value_norm_shape, dtype=dtype))
+
+        # Initialize a buffer for the attention histories, for attention score feature
+        history_num_shape = (
+            max_batch_size,
+            n_heads,
+            self.max_cache_length,
+            self.history_window_size,
+        )
+        history_denom_shape = (
+            max_batch_size,
+            n_heads,
+            self.max_cache_length,
+        )
+        # If attn_thresholding, we store a binary indicator of whether the attention >= uniform attention
+        # If not, we store the raw attention values
+        # If history_window_size = 1, we accumulate the full history in one slot so we need a dtype with large range
+        history_num_dtype = (
+            torch.bool
+            if self.attn_thresholding
+            else torch.float64 if self.history_window_size == 1 else dtype
+        )
+        self.register_buffer(
+            "attn_history_num",
+            torch.zeros(history_num_shape, dtype=history_num_dtype),
+        )
+
+        # Ideally, we could use the self.pos to track the number of times a token has been attended to
+        # But any change to cache management or how self.pos is stored would break this.
+        self.register_buffer(
+            "attn_history_denom", torch.zeros(history_denom_shape, dtype=torch.int32)
+        )
+
+        self.register_buffer("attn_counter", torch.zeros((1,), dtype=torch.int64))
+
+    def reset(self):
+        super().reset()
+        self.key_norm.zero_()
+        self.value_norm.zero_()
+        self.attn_history_num.zero_()
+        self.attn_history_denom.zero_()
+        self.attn_counter.zero_()
+
+    def return_attn(self) -> bool:
+        return True
+
+    def _compute_token_scores(self, key_norm, value_norm, attn_scores):
+        """
+        Compute token importance scores using lightweight models.
+        Args:
+            key_norm (torch.Tensor): L2 norm of key vectors.
+            value_norm (torch.Tensor): L2 norm of value vectors.
+            attn_scores (torch.Tensor): Attention scores for tokens.
+
+        Returns:
+            scores (torch.Tensor): Scores for each token, shape [batch_size, n_heads, seq_len].
+        """
+        features = torch.stack(
+            [key_norm, value_norm, attn_scores], dim=-1
+        )  # [batch_size, n_heads, seq_len, 3]
+        scores = torch.zeros_like(key_norm)
+
+        for head_idx, model in enumerate(self.models):
+            # Apply model to each head's features
+            scores[:, head_idx, :] = model(features[:, head_idx, :]).squeeze(-1)
+
+        return scores
+
+    def _eviction_idx(self, key_norm, value_norm, attn_scores, input_pos):
+        """
+        Determine tokens to evict based on computed scores.
+        Args:
+            key_norm, value_norm, attn_scores: Features used for scoring tokens.
+            input_pos: Position of tokens in the cache.
+
+        Returns:
+            fill_idxs (torch.Tensor): Indices of tokens to evict.
+        """
+        scores = self._compute_token_scores(key_norm, value_norm, attn_scores)
+
+        # Save global & recent tokens from eviction
+        scores.masked_fill_(
+            torch.logical_or(
+                self.pos < self.global_tokens,
+                self.pos >= input_pos - self.recent_window,
+            ),
+            float("inf"),
+        )
+
+        # Evict unfilled slots first
+        scores.masked_fill_(self.pos == -1, -float("inf"))
+
+        # Select tokens with the lowest scores
+        fill_idxs = scores.argmin(dim=-1)
+
+        return fill_idxs
+
+    def update_state(self, input_pos, k_val, v_val, is_prefill, attn, **kwargs):
+        """
+        Update cache with new tokens and evict least important ones based on scores.
+        Args:
+            input_pos, k_val, v_val, attn: Inputs for cache update.
+        """
+        key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
+        value_norm = torch.linalg.vector_norm(v_val, ord=2, dim=-1)
+
+        fill_idxs = self._eviction_idx(key_norm, value_norm, attn, input_pos)
+        self._fill(input_pos, k_val, v_val, fill_idxs=fill_idxs)
+
+
 class KVCacheHeavyHitter(KVCacheHeadSpecific):
     # This class mostly follows the logic in ScissorHands (https://arxiv.org/abs/2305.17118)
     # But it is very similar to other Heavy Hitter methods (H20, PyramidKV, etc.)
@@ -661,9 +1053,7 @@ class KVCacheHeavyHitter(KVCacheHeadSpecific):
         history_num_dtype = (
             torch.bool
             if self.attn_thresholding
-            else torch.float64
-            if self.history_window_size == 1
-            else dtype
+            else torch.float64 if self.history_window_size == 1 else dtype
         )
         self.register_buffer(
             "attn_history_num",
@@ -1457,6 +1847,8 @@ def get_cache_constructor(cache_strategy):
         cls = KVCacheHybrid
     elif cache_strategy == "keep_it_odd":
         cls = KVCacheKeepItOdd
+    elif cache_strategy == "lightweight":
+        cls = KVCacheLightweight
     elif cache_strategy.startswith("debug"):
         cache_strategy = re.sub(r"debug_+", "", cache_strategy).strip()
         relevant_kwargs = get_cache_constructor(cache_strategy)[1] + [
