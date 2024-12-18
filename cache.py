@@ -109,6 +109,13 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Whether to accumulate number of times a token was unimportant (binary) versus raw un-normalized probabilities. If true, more memory efficient.",
     )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="linear",
+        choices=["linear", "mlp"],
+        help="Lightweight model type: 'linear' or 'mlp'.",
+    )
 
     # Hybrid, e.g., FastGen, specific hyperparameters (--cache_strategy == "hybrid")
     parser.add_argument(
@@ -425,7 +432,6 @@ class KVCache(ABC, nn.Module):
 
         # Quantize the cache after updating
         self.quantize_cache()
-
         return k, v, mask
 
     def update_state(self, *args, **kwargs):
@@ -439,6 +445,7 @@ class KVCache(ABC, nn.Module):
         Decoding logic for the cache.
         """
         eviction_idx = self._eviction_idx(input_pos)
+        print("Eviction_idx: ", eviction_idx)
 
         # Num insertions means we inserted into an unfilled slot (previous pos == -1)
         # They should be all the same unless variable_length = True
@@ -454,7 +461,6 @@ class KVCache(ABC, nn.Module):
 
     def _eviction_idx(self, input_pos):
         scores = self._token_importances(input_pos)
-
         if scores.ndim == 1:
             scores = scores.unsqueeze(0)
 
@@ -663,7 +669,6 @@ class KVCacheHeadSpecific(KVCache):
         # input_pos [seq_len] or [num_heads, seq_len]
         # k_val, v_val [batch_size, n_heads, seq_len, head_dim]
         assert input_pos.shape[-1] == k_val.shape[2] == v_val.shape[2]
-
         # input_pos is either [seq_len] or [num_heads, seq_len]
         pos_fill_indices = fill_idxs.view(1, -1, 1)
         cache_fill_indices = fill_idxs.view(1, len(fill_idxs), 1, 1).expand(
@@ -769,6 +774,7 @@ class KVCacheL2(KVCacheHeadSpecific):
     def _decoding_update(self, input_pos, k_val, v_val, **kwargs):
         # Same as KVCacheHeadSpecific, but we also update the L2 norm of the keys for decoding
         fill_indices = self._eviction_idx(input_pos)
+        print("Eviction_idx: ", fill_indices)
         num_insertions = (
             (self.pos.gather(2, fill_indices.view(1, -1, 1)).squeeze() == -1)
             .int()
@@ -845,7 +851,7 @@ For **head-specific caching** (`head_specific=True`), the following assumptions 
 """
 
 
-class KVCacheLightweight(KVCacheHeadSpecific):
+class KVCacheLightweight1(KVCacheHeadSpecific):
     relevant_kwargs = [
         "max_cache_length",
         "max_seq_length",
@@ -869,7 +875,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         if model_type == "linear":
             self.models = nn.ModuleList(
                 [
-                    nn.Linear(3, 1)
+                    nn.Linear(3, 1).to(torch.bfloat16)
                     for _ in range(
                         n_heads
                     )  # Input features: key_norm, value_norm, attention score
@@ -882,12 +888,44 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         nn.Linear(3, 16),  # Input features
                         nn.ReLU(),
                         nn.Linear(16, 1),
-                    )
+                    ).to(torch.bfloat16)
                     for _ in range(n_heads)
                 ]
             )
         else:
             raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
+
+        # Initialize weights and biases
+        with torch.no_grad():
+            # Weights for the `linear` models
+            if model_type == "linear":
+                for model in self.models:
+                    model.weight.copy_(
+                        torch.tensor([[-1.0, -1.0, 1.0]])
+                    )  # Shape: [1, 3]
+                    model.bias.copy_(torch.tensor([0.0]))  # Shape: [1]
+
+            # Weights for the `mlp` models
+            elif model_type == "mlp":
+                for model in self.models:
+                    # First layer weights: Shape [16, 3]
+                    model[0].weight.copy_(
+                        torch.tensor(
+                            [[-1.0, -1.0, 1.0]]
+                            * 16  # Replicate the relationship across all 16 neurons
+                        )
+                    )
+                    model[0].bias.copy_(
+                        torch.zeros(16)
+                    )  # Zero bias for the first layer
+
+                    # Second layer weights: Shape [1, 16]
+                    model[2].weight.copy_(
+                        torch.ones(1, 16)  # Equal contribution from all 16 features
+                    )
+                    model[2].bias.copy_(
+                        torch.tensor([0.0])
+                    )  # Zero bias for the second layer
 
         # getting the key buffer, as key norm is a feature
         key_norm_shape = (max_batch_size, n_heads, self.max_cache_length)
@@ -896,53 +934,22 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         value_norm_shape = (max_batch_size, n_heads, self.max_cache_length)
         self.register_buffer("value_norm", torch.zeros(value_norm_shape, dtype=dtype))
 
-        # Initialize a buffer for the attention histories, for attention score feature
-        history_num_shape = (
-            max_batch_size,
-            n_heads,
-            self.max_cache_length,
-            self.history_window_size,
-        )
-        history_denom_shape = (
-            max_batch_size,
-            n_heads,
-            self.max_cache_length,
-        )
-        # If attn_thresholding, we store a binary indicator of whether the attention >= uniform attention
-        # If not, we store the raw attention values
-        # If history_window_size = 1, we accumulate the full history in one slot so we need a dtype with large range
-        history_num_dtype = (
-            torch.bool
-            if self.attn_thresholding
-            else torch.float64 if self.history_window_size == 1 else dtype
-        )
-        self.register_buffer(
-            "attn_history_num",
-            torch.zeros(history_num_shape, dtype=history_num_dtype),
-        )
-
-        # Ideally, we could use the self.pos to track the number of times a token has been attended to
-        # But any change to cache management or how self.pos is stored would break this.
-        self.register_buffer(
-            "attn_history_denom", torch.zeros(history_denom_shape, dtype=torch.int32)
-        )
-
-        self.register_buffer("attn_counter", torch.zeros((1,), dtype=torch.int64))
+        # Register a buffer for the attention scores
+        attn_score_shape = (max_batch_size, n_heads, self.max_cache_length)
+        self.register_buffer("attn_score", torch.zeros(attn_score_shape, dtype=dtype))
 
     def reset(self):
         super().reset()
         self.key_norm.zero_()
         self.value_norm.zero_()
-        self.attn_history_num.zero_()
-        self.attn_history_denom.zero_()
-        self.attn_counter.zero_()
+        self.attn_score.zero_()
 
     def return_attn(self) -> bool:
         return True
 
-    def _compute_token_scores(self, key_norm, value_norm, attn_scores):
+    def _compute_token_scores(self, input_pos, key_norm, value_norm, attn):
         """
-        Compute token importance scores using lightweight models.
+        Compute token importance scores using lightweight models. use
         Args:
             key_norm (torch.Tensor): L2 norm of key vectors.
             value_norm (torch.Tensor): L2 norm of value vectors.
@@ -951,8 +958,19 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         Returns:
             scores (torch.Tensor): Scores for each token, shape [batch_size, n_heads, seq_len].
         """
-        features = torch.stack(
-            [key_norm, value_norm, attn_scores], dim=-1
+
+        # Resize attn to be max cache length with zero padding if need be
+        seq_len = attn.shape[-1]
+
+        if (
+            attn.ndim == 4
+        ):  # Prefill, we may receive the full attention map and have to average across queries
+            # Normalize using input_pos to only count non-zero attentions bc/ of causal mask
+            attn_scores = attn.sum(dim=-1) / (seq_len - input_pos)
+        # print(attn_scores)
+
+        features = torch.stack([key_norm, value_norm, attn_scores], dim=-1).to(
+            torch.bfloat16
         )  # [batch_size, n_heads, seq_len, 3]
         scores = torch.zeros_like(key_norm)
 
@@ -962,7 +980,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
         return scores
 
-    def _eviction_idx(self, key_norm, value_norm, attn_scores, input_pos):
+    def _eviction_idx(self, key_norm, value_norm, attn, input_pos):
         """
         Determine tokens to evict based on computed scores.
         Args:
@@ -972,24 +990,52 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         Returns:
             fill_idxs (torch.Tensor): Indices of tokens to evict.
         """
-        scores = self._compute_token_scores(key_norm, value_norm, attn_scores)
+        scores = self._compute_token_scores(input_pos, key_norm, value_norm, attn)
+        # print(scores)
 
-        # Save global & recent tokens from eviction
-        scores.masked_fill_(
-            torch.logical_or(
-                self.pos < self.global_tokens,
-                self.pos >= input_pos - self.recent_window,
-            ),
-            float("inf"),
+        # Expand input_pos for broadcasting
+        input_pos_expanded = input_pos.view(1, 1, -1)  # [1, 1, seq_len]
+
+        # Ensure input_pos_expanded matches self.pos in length
+        if input_pos_expanded.size(2) < self.pos.size(2):
+            # Pad input_pos_expanded with -1 to match self.pos
+            padding = self.pos.size(2) - input_pos_expanded.size(2)
+            input_pos_expanded = F.pad(input_pos_expanded, (0, padding), value=-1)
+        elif input_pos_expanded.size(2) > self.pos.size(2):
+            # Slice input_pos_expanded if it's longer than self.pos
+            input_pos_expanded = input_pos_expanded[:, :, : self.pos.size(2)]
+
+        # Mask global and recent tokens to prevent eviction
+        protection_mask = (self.pos < self.global_tokens) | (
+            self.pos >= input_pos_expanded - self.recent_window
         )
+        scores.masked_fill_(protection_mask, float("inf"))
 
-        # Evict unfilled slots first
+        # Prioritize unfilled slots for eviction
         scores.masked_fill_(self.pos == -1, -float("inf"))
 
-        # Select tokens with the lowest scores
+        # Select indices of tokens with the lowest scores
         fill_idxs = scores.argmin(dim=-1)
 
         return fill_idxs
+
+    def _decoding_update(self, input_pos, k_val, v_val, **kwargs):
+        """
+        Decoding logic for the cache.
+        """
+        eviction_idx = self._eviction_idx(input_pos)
+
+        # Num insertions means we inserted into an unfilled slot (previous pos == -1)
+        # They should be all the same unless variable_length = True
+        num_insertions = (
+            (self.pos.gather(2, eviction_idx.view(1, -1, 1)).squeeze() == -1)
+            .int()
+            .view(-1)
+        )
+
+        self._fill(input_pos, k_val, v_val, fill_idxs=eviction_idx)
+
+        return num_insertions
 
     def update_state(self, input_pos, k_val, v_val, is_prefill, attn, **kwargs):
         """
@@ -1002,6 +1048,218 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
         fill_idxs = self._eviction_idx(key_norm, value_norm, attn, input_pos)
         self._fill(input_pos, k_val, v_val, fill_idxs=fill_idxs)
+
+
+class KVCacheLightweight(KVCacheHeadSpecific):
+    # This class mostly follows the logic in ScissorHands (https://arxiv.org/abs/2305.17118)
+    # But it is very similar to other Heavy Hitter methods (H20, PyramidKV, etc.)
+    relevant_kwargs = [
+        "max_cache_length",
+        "max_seq_length",
+        "cache_bits",
+        "global_tokens",
+        "history_window_size",
+        "recent_window",
+        "model_type",
+    ]
+
+    def __init__(
+        self,
+        max_batch_size,
+        n_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        variable_length=False,
+        **kwargs,
+    ):
+        super().__init__(
+            max_batch_size,
+            n_heads,
+            head_dim,
+            dtype,
+            variable_length,
+            **kwargs,
+        )
+
+        # Initialize buffers for the attention scores, key norms, and value norms
+        score_shape = (max_batch_size, n_heads, self.max_cache_length)
+        self.register_buffer("attn_scores", torch.zeros(score_shape, dtype=dtype))
+        self.register_buffer("key_norm", torch.zeros(score_shape, dtype=dtype))
+        self.register_buffer("value_norm", torch.zeros(score_shape, dtype=dtype))
+
+        # Lightweight models for computing token scores
+        if kwargs["model_type"] == "linear":
+            self.models = nn.ModuleList(
+                [nn.Linear(3, 1).to(dtype) for _ in range(n_heads)]
+            )
+        elif kwargs["model_type"] == "mlp":
+            self.models = nn.ModuleList(
+                [
+                    nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1)).to(
+                        dtype
+                    )
+                    for _ in range(n_heads)
+                ]
+            )
+        else:
+            raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
+
+        # Initialize weights and biases
+        with torch.no_grad():
+            # Weights for the `linear` models
+            if kwargs["model_type"] == "linear":
+                for model in self.models:
+                    model.weight.copy_(
+                        torch.tensor([[-1.0, -1.0, 1.0]])
+                    )  # Shape: [1, 3]
+                    model.bias.copy_(torch.tensor([0.0]))  # Shape: [1]
+
+            # Weights for the `mlp` models
+            elif kwargs["model_type"] == "mlp":
+                for model in self.models:
+                    # First layer weights: Shape [16, 3]
+                    model[0].weight.copy_(
+                        torch.tensor(
+                            [[-1.0, -1.0, 1.0]]
+                            * 16  # Replicate the relationship across all 16 neurons
+                        )
+                    )
+                    model[0].bias.copy_(
+                        torch.zeros(16)
+                    )  # Zero bias for the first layer
+
+                    # Second layer weights: Shape [1, 16]
+                    model[2].weight.copy_(
+                        torch.ones(1, 16)  # Equal contribution from all 16 features
+                    )
+                    model[2].bias.copy_(
+                        torch.tensor([0.0])
+                    )  # Zero bias for the second layer
+
+    def reset(self):
+        super().reset()
+        self.attn_scores.zero_()
+        self.key_norm.zero_()
+        self.value_norm.zero_()
+
+    def return_attn(self) -> bool:
+        return True
+
+    def update_state(self, input_pos, k_val, v_val, is_prefill, attn, **kwargs):
+        """
+        Update current attention scores, key norms, and value norms for each token.
+
+        Args:
+            input_pos (torch.Tensor): Input positions in the sequence.
+            k_val (torch.Tensor): Key values of shape [batch_size, n_heads, seq_len, head_dim].
+            v_val (torch.Tensor): Value values of shape [batch_size, n_heads, seq_len, head_dim].
+            is_prefill (bool): Indicates whether this is the prefill phase.
+            attn (torch.Tensor): Attention scores of shape [batch_size, n_heads, seq_len, seq_len].
+        """
+
+        if is_prefill:
+            # Calculate norms over head_dim
+            key_norm = torch.linalg.vector_norm(
+                k_val, ord=2, dim=-1
+            )  # [batch_size, n_heads, prompt_len]
+            value_norm = torch.linalg.vector_norm(
+                v_val, ord=2, dim=-1
+            )  # [batch_size, n_heads, prompt_len]
+            # Handle prefill phase
+            if (
+                attn.ndim == 4
+            ):  # Full attention map received, [batch_size, n_heads, prompt_len, prompt_len]
+                seq_len = attn.shape[-1]
+                attn = attn.squeeze(0).sum(dim=1) / (seq_len - input_pos)
+            attn = attn.view(1, self.n_heads, -1)  # [batch_size, n_heads, prompt_len]
+
+            # Save norms and attention scores only for valid prompt length
+            seq_len = attn.shape[-1]
+            self.attn_scores[:, :, :seq_len] = attn
+            self.key_norm[:, :, :seq_len] = key_norm
+            self.value_norm[:, :, :seq_len] = value_norm
+        else:
+            # Generation phase: compute and update only new key and value norms, but full attention scores
+            current_pos = input_pos.item()  # Position of the current token
+            seq_len = (
+                current_pos + 1
+            )  # Total processed length including the current token
+            # Calculate norms over head_dim
+            key_norm = torch.linalg.vector_norm(
+                k_val[:, :, current_pos, :], ord=2, dim=-1
+            )  # [batch_size, n_heads, seq_len]
+            value_norm = torch.linalg.vector_norm(
+                v_val[:, :, current_pos, :], ord=2, dim=-1
+            )  # [batch_size, n_heads, 1]
+
+            # Reshape attention scores and ensure they're up to seq_len
+            attn = attn.view(1, self.n_heads, -1)  # torch.Size([1, 2, max_len])
+            self.attn_scores[:, :, :seq_len] = attn[
+                :, :, :seq_len
+            ]  # torch.Size([1, 2, seq_len])
+
+            # Update only the current token's key and value norms
+            self.key_norm[:, :, current_pos] = key_norm
+            self.value_norm[:, :, current_pos] = value_norm
+
+    def _token_importances(self, input_pos):
+        """
+        Compute token importance scores using lightweight models.
+
+        Args:
+            input_pos (torch.Tensor): Input positions in the sequence.
+
+        Returns:
+            torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
+        """
+        seq_len = input_pos.int()  # Current sequence length
+
+        # Extract features for the current sequence length
+        features = torch.stack(
+            [
+                self.key_norm[:, :, :seq_len],  # Shape: [batch_size, n_heads, seq_len]
+                self.value_norm[:, :, :seq_len],
+                self.attn_scores[:, :, :seq_len],
+            ],
+            dim=-1,  # Shape: [batch_size, n_heads, seq_len, 3]
+        )
+
+        # Initialize scores with shape [batch_size, n_heads, max_cache_length]
+        max_cache_length = self.key_norm.shape[-1]
+        scores = torch.full(
+            (features.shape[0], features.shape[1], max_cache_length),
+            float("-inf"),  # Initialize with low values
+            dtype=features.dtype,
+            device=features.device,
+        )
+
+        # Compute scores for the current seq_len using lightweight models
+        computed_scores = torch.zeros(
+            features.shape[:-1], dtype=features.dtype, device=features.device
+        )  # Shape: [batch_size, n_heads, seq_len]
+
+        for head_idx, model in enumerate(self.models):
+            computed_scores[:, head_idx, :] = model(features[:, head_idx, :]).squeeze(
+                -1
+            )
+
+        # Update the valid portion of scores
+        scores[:, :, :seq_len] = computed_scores
+
+        # Apply masking
+        seq_pos = self.pos[:, :, :seq_len]  # Shape: [batch_size, n_heads, seq_len]
+        scores[:, :, :seq_len].masked_fill_(
+            seq_pos == -1, -float("inf")
+        )  # Mask unfilled slots, should not be the case
+        scores[:, :, :seq_len].masked_fill_(
+            seq_pos >= input_pos - self.recent_window, float("inf")
+        )  # Mask recent tokens
+
+        # Remove batch dimension, not implemented yet
+        # TODO: make it batch compatible
+        scores = scores.squeeze(0)  # Shape: [n_heads, max_cache_length]
+
+        return scores
 
 
 class KVCacheHeavyHitter(KVCacheHeadSpecific):
@@ -1127,6 +1385,8 @@ class KVCacheHeavyHitter(KVCacheHeadSpecific):
 
         avg_attn = numerator / denominator
 
+        print("Self.pos: ", self.pos, self.pos.shape)
+        print("Input_pos: ", input_pos, input_pos.shape)
         # Save the global & most recent tokens from being evicted
         avg_attn.masked_fill_(
             torch.logical_or(
