@@ -1,5 +1,6 @@
 import math
 import regex as re
+import pdb
 from abc import ABC, abstractmethod
 from collections import Counter
 from prompt_compression import get_prompt_compressor_constructor
@@ -445,7 +446,6 @@ class KVCache(ABC, nn.Module):
         Decoding logic for the cache.
         """
         eviction_idx = self._eviction_idx(input_pos)
-        print("Eviction_idx: ", eviction_idx)
 
         # Num insertions means we inserted into an unfilled slot (previous pos == -1)
         # They should be all the same unless variable_length = True
@@ -1212,6 +1212,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         Returns:
             torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
         """
+        # pdb.set_trace()
         seq_len = input_pos.int()  # Current sequence length
 
         # Extract features for the current sequence length

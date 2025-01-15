@@ -6,6 +6,7 @@
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Optional, Dict, Any
+import pdb
 
 import math
 import torch
@@ -14,7 +15,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from attention_utils import scaled_dot_product_attention
-from cache import get_cache_constructor
+from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
 
 
@@ -188,6 +189,15 @@ class Transformer(nn.Module):
         # Fixed for now
         self.max_batch_size = 1
 
+        # Placeholder for lightweight model modules
+        self.kv_cache_lightweight_modules = {}  # Populated in self.setup_caches()
+        self.train_mode = False
+
+    def set_train_mode(self, mode: bool):
+        self.train_mode = mode
+        for layer in self.layers:
+            layer.attention.train_mode = mode
+
     def setup_caches(self, **kwargs):
         cache_strategy = kwargs.pop("cache_strategy")
 
@@ -199,6 +209,7 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
+
         for layer_idx, b in enumerate(self.layers):
             cache_constructor, relevant_kwargs = get_cache_constructor(
                 cache_strategy=cache_strategy[layer_idx]
@@ -220,6 +231,11 @@ class Transformer(nn.Module):
                 dtype,
                 **layer_kwargs,
             )
+            if cache_strategy[layer_idx] == "lightweight":
+                self.kv_cache_lightweight_modules[layer_idx] = (
+                    b.attention.kv_cache.models
+                )
+
             b.attention.prompt_compressor = get_prompt_compressor_constructor(
                 kwargs["prompt_compression_strategy"][layer_idx]
             )(head_specific=b.attention.kv_cache.head_specific, **layer_kwargs)
@@ -264,6 +280,12 @@ class Transformer(nn.Module):
 
     def min_cache_length(self):
         return min([layer.attention.kv_cache.max_cache_length for layer in self.layers])
+
+    def get_lightweight_params(self):
+        params = []
+        for layer_idx, models in self.kv_cache_lightweight_modules.items():
+            params.extend(models.parameters())
+        return params
 
     def forward(
         self,
@@ -343,6 +365,7 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.train_mode = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -384,7 +407,11 @@ class Attention(nn.Module):
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        v = v.transpose(
+            1, 2
+        )  # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode
+
+        # pdb.set_trace()
 
         kv_mask = None
         cache_kwargs = {"input_ids": input_ids}
@@ -425,6 +452,42 @@ class Attention(nn.Module):
         # [Optional] Update the KV Cache internal state now that we have attention probabilities
         # This is a no-op for most cache classes
         self.kv_cache.update_state(input_pos, k, v, is_prefill, attn, **cache_kwargs)
+
+        # Call lightweight models to scale KV pairs
+        if (
+            self.train_mode
+            and is_prefill
+            and isinstance(self.kv_cache, KVCacheLightweight)
+        ):
+            # Compute scores using KVCacheLightweight
+            scores = self.kv_cache._token_importances(
+                input_pos[-1]
+            )  # try normalizing the scores
+            # pdb.set_trace()
+            # Scale keys and values using the scores
+            scaling_factors = torch.sigmoid(scores).unsqueeze(
+                -1
+            )  # Shape: [n_heads, seq_len, 1]
+            # TODO: Try out different settings with key and / or value scaling
+            # k = k * scaling_factors
+            scaling_factors = scaling_factors[:, : v.size(2), :]
+            scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+
+            v = v * scaling_factors
+
+            # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+            y, attn = scaled_dot_product_attention(
+                q,
+                k_rep,
+                v_rep,
+                attn_mask=kv_mask if mask is None else mask,
+                dropout_p=0.0,
+                attn_top_k=attn_top_k,
+                # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
+                return_attn=self.kv_cache.return_attn(),
+            )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
