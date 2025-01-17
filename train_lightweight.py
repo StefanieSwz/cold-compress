@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import signal
 import pdb
 from typing import *
 from pathlib import Path
@@ -8,12 +9,12 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.distributed.pipelining import Pipe
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import torch._dynamo.config
 import torch._inductor.config
 from datasets import load_dataset
-from tp import maybe_init_dist
+from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
 from tokenizer import get_tokenizer, encode, TokenizersChatFormat
 
@@ -32,20 +33,9 @@ torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce c
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-
-def setup_env_variables():
-    # Set environment variables for distributed training
-    os.environ["MASTER_ADDR"] = "localhost"  # Set master address
-    os.environ["MASTER_PORT"] = "12345"  # Set master port
-    os.environ["LOCAL_WORLD_SIZE"] = "8"  # Total number of processes
-    print("Rank: ", os.environ.get("RANK"))
-    print("Rank: ", os.environ.get("LOCAL_RANK"))
-    os.environ["RANK"] = os.environ.get("RANK", "0")  # Default to rank 0
-    os.environ["LOCAL_RANK"] = os.environ.get("LOCAL_RANK", "0")  # Default to GPU 0
-
-
-# Call the function to set environment variables
-setup_env_variables()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+signal.signal(signal.SIGINT, handle_sigint)
+sys.excepthook = handle_uncaught_exception
 
 # Configuration
 CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
@@ -68,14 +58,14 @@ if not TOKENIZER_PATH.is_file():
 
 # Load model
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-pdb.set_trace()
+# pdb.set_trace()
 rank = maybe_init_dist()
 print("Rank: ", rank)
 use_tp = rank is not None
-# if use_tp:
-#     if rank != 0:
-#         # only print on rank 0
-#         print = lambda *args, **kwargs: None
+if use_tp:
+    if rank != 0:
+        # only print on rank 0
+        print = lambda *args, **kwargs: None
 
 print(f"Using device={DEVICE}")
 PRECISION = torch.bfloat16
@@ -93,20 +83,44 @@ print(f"Time to load model: {time.time() - t0:.02f} seconds")
 # Load tokenizer
 tokenizer_ultrachat = get_tokenizer(TOKENIZER_PATH, CHECKPOINT_PATH, is_chat=IS_CHAT)
 
-# Define the cache strategy and related configurations
-cache_strategy = ["lightweight"] * len(
-    model.layers
-)  # Example: lightweight for all layers
-max_cache_length = [MAX_SEQ_LENGTH] * len(model.layers)
-recent_window = [32] * len(model.layers)
-prompt_compression_strategy = ["none"] * len(model.layers)
+# # Define the cache strategy and related configurations
+# cache_strategy = ["lightweight"] * len(
+#     model.layers
+# )  # Example: lightweight for all layers
+# max_cache_length = [MAX_SEQ_LENGTH] * len(model.layers)
+# recent_window = [32] * len(model.layers)
+# prompt_compression_strategy = ["none"] * len(model.layers)
 
-# copied from the generation kwargs
+# # copied from the generation kwargs
+# cache_kwargs = {
+#     # "prompt": "What is a cold compress?",
+#     "max_new_tokens": 512,
+#     "cache_config": None,
+#     "checkpoint_path": Path("checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth"),
+#     "profile": None,
+#     "compile": False,
+#     "device": "cuda",
+#     "attn_top_k": 1.0,
+#     "max_cache_length": [1.0],
+#     "cache_bits": None,
+#     "cache_length_pattern": "tile",
+#     "cache_strategy": ["lightweight"],
+#     "cache_strategy_pattern": "tile",
+#     "feed_long_prompts": False,
+#     "prompt_compression_strategy": ["full"],
+#     "global_tokens": 1,
+#     "recent_window": 10,
+#     "history_window_size": 1,
+#     "attn_thresholding": False,
+#     "model_type": "linear",
+#     "min_recovery_frac": 0.9,
+# }
+
 cache_kwargs = {
     # "prompt": "What is a cold compress?",
     "max_new_tokens": 512,
     "cache_config": None,
-    "checkpoint_path": Path("checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth"),
+    "checkpoint_path": Path("checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth"),
     "profile": None,
     "compile": False,
     "device": "cuda",
@@ -117,7 +131,7 @@ cache_kwargs = {
     "cache_strategy": ["lightweight"],
     "cache_strategy_pattern": "tile",
     "feed_long_prompts": False,
-    "prompt_compression_strategy": ["recent_global"],
+    "prompt_compression_strategy": ["full"],
     "global_tokens": 1,
     "recent_window": 10,
     "history_window_size": 1,
@@ -129,27 +143,6 @@ cache_kwargs = {
 setup_caches(
     model, tokenizer_ultrachat, DEVICE, MAX_SEQ_LENGTH, cache_kwargs
 )  # access compression technique
-
-
-# Function to partition layers dynamically across available GPUs
-def create_pipeline(model, num_gpus):
-    # Get the total number of layers
-    total_layers = len(model.layers)
-
-    # Compute the number of layers per GPU
-    layers_per_gpu = (total_layers + num_gpus - 1) // num_gpus  # Ceiling division
-
-    # Partition layers into chunks for each GPU
-    partitions = []
-    for i in range(num_gpus):
-        start = i * layers_per_gpu
-        end = min((i + 1) * layers_per_gpu, total_layers)
-        if start < end:  # Avoid empty partitions
-            partition = nn.Sequential(*model.layers[start:end]).to(f"cuda:{i}")
-            partitions.append(partition)
-
-    # Create the pipeline
-    return Pipe(nn.Sequential(*partitions), chunks=1)
 
 
 # Load dataset
@@ -266,12 +259,13 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
 # for name, param in model.named_parameters():
 #     print(name)
 for name, param in model.named_parameters():
+    print(name)
     if "attention.kv_cache.models" in name:
         param.requires_grad = True
     else:
         param.requires_grad = False
 
-pdb.set_trace()
+# pdb.set_trace()
 
 # Optimizer
 optimizer = AdamW(model.get_lightweight_params(), lr=LEARNING_RATE)
@@ -283,7 +277,7 @@ model.train()
 model.set_train_mode(True)
 for epoch in range(EPOCHS):
     total_loss = 0
-    pdb.set_trace()
+    # pdb.set_trace()
     for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}"):
         batch = {
             key: value.to(DEVICE) if torch.is_tensor(value) else value
@@ -291,6 +285,8 @@ for epoch in range(EPOCHS):
         }
         input_ids = batch["input_ids"]  # Inputs
         labels = batch["labels"]  # Targets
+        labels = labels[:, 1:]  # Remove the first token to align with logits
+        labels = labels.reshape(-1)  # Flatten to match logits shape
 
         # Input positions and prefill flags
         prompt_length = input_ids.size(1)
@@ -307,14 +303,14 @@ for epoch in range(EPOCHS):
         logits = model(
             input_ids, input_pos, mask=causal_mask, is_prefill=True
         )  # prefill = true for training on full sequence
-        # pdb.set_trace()
+        pdb.set_trace()
         # Loss computation
         logits = logits[:, :-1].reshape(-1, logits.size(-1))
         labels = labels.reshape(-1)
         loss_epoch = loss(logits, labels)
 
         # Backward pass
-        loss_epoch.backward()
+        loss_epoch.backward()  # out of memory error
 
         optimizer.step()
 
@@ -323,7 +319,29 @@ for epoch in range(EPOCHS):
     avg_loss = total_loss / len(train_loader)
     print(f"Epoch {epoch + 1}/{EPOCHS} completed. Average Loss: {avg_loss:.4f}")
 
+
 # Save the model
-MODEL_SAVE_PATH = "./lightweight_weights/trained_transformer.pth"
-torch.save(model.state_dict(), MODEL_SAVE_PATH)
-print(f"Model saved to {MODEL_SAVE_PATH}")
+def save_model_weights(model, kwargs):
+    # Extract model name and type from kwargs
+    model_name = kwargs.get("checkpoint_path", "default_model").stem
+    model_type = kwargs.get("model_type", "unknown")
+
+    # Generate a timestamp for the save file
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Define the save directory and file path
+    save_dir = Path(f"./lightweight_weights/{model_name}")
+    save_dir.mkdir(
+        parents=True, exist_ok=True
+    )  # Create the directory if it doesn't exist
+
+    save_path = save_dir / f"{timestamp}_{model_type}.pth"
+
+    # Save the model state_dict
+    torch.save(model.state_dict(), save_path)
+
+    print(f"Model saved to {save_path}")
+
+
+save_model_weights(model, cache_kwargs)
+dist.destroy_process_group()

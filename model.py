@@ -298,6 +298,7 @@ class Transformer(nn.Module):
         assert self.freqs_cis is not None, "Caches must be initialized first"
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+        print("Tensor x shape: ", x.shape)
 
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -396,6 +397,10 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
+        # print(f"[DEBUG] wqkv.weight.shape = {self.wqkv.weight.shape}")
+        # print(
+        #     f"[DEBUG] wqkv.bias.shape   = {self.wqkv.bias.shape if self.wqkv.bias is not None else 'None'}"
+        # )
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
@@ -412,6 +417,9 @@ class Attention(nn.Module):
         )  # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode
 
         # pdb.set_trace()
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            print(f"[DEBUG] Rank {rank} entering attention computation.")
 
         kv_mask = None
         cache_kwargs = {"input_ids": input_ids}
@@ -426,16 +434,32 @@ class Attention(nn.Module):
         k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        y, attn = scaled_dot_product_attention(
-            q,
-            k_rep,
-            v_rep,
-            attn_mask=kv_mask if mask is None else mask,
-            dropout_p=0.0,
-            attn_top_k=attn_top_k,
-            # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
-            return_attn=self.kv_cache.return_attn(),
-        )
+        if self.train_mode:
+            with torch.no_grad():
+                _, attn = scaled_dot_product_attention(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
+                    return_attn=self.kv_cache.return_attn(),
+                )
+                if torch.distributed.is_initialized():
+                    rank = torch.distributed.get_rank()
+                    print(f"[DEBUG] Rank {rank} after attention computation 1.")
+        else:
+            y, attn = scaled_dot_product_attention(
+                q,
+                k_rep,
+                v_rep,
+                attn_mask=kv_mask if mask is None else mask,
+                dropout_p=0.0,
+                attn_top_k=attn_top_k,
+                # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
+                return_attn=self.kv_cache.return_attn(),
+            )
 
         if (
             attn is not None
@@ -452,6 +476,9 @@ class Attention(nn.Module):
         # [Optional] Update the KV Cache internal state now that we have attention probabilities
         # This is a no-op for most cache classes
         self.kv_cache.update_state(input_pos, k, v, is_prefill, attn, **cache_kwargs)
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            print(f"[DEBUG] Rank {rank} updated caches.")
 
         # Call lightweight models to scale KV pairs
         if (
@@ -474,6 +501,9 @@ class Attention(nn.Module):
             scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
 
             v = v * scaling_factors
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                print(f"[DEBUG] Rank {rank} applying scaling of")
 
             # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
             v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)

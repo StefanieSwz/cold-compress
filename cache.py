@@ -1104,37 +1104,47 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         else:
             raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
 
-        # Initialize weights and biases
         with torch.no_grad():
-            # Weights for the `linear` models
-            if kwargs["model_type"] == "linear":
-                for model in self.models:
-                    model.weight.copy_(
-                        torch.tensor([[-1.0, -1.0, 1.0]])
-                    )  # Shape: [1, 3]
-                    model.bias.copy_(torch.tensor([0.0]))  # Shape: [1]
+            for model in self.models:
+                for name, param in model.named_parameters():
+                    if "weight" in name:
+                        # Initialize weights with Gaussian distribution
+                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
+                    elif "bias" in name:
+                        # Initialize biases with Gaussian distribution
+                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
 
-            # Weights for the `mlp` models
-            elif kwargs["model_type"] == "mlp":
-                for model in self.models:
-                    # First layer weights: Shape [16, 3]
-                    model[0].weight.copy_(
-                        torch.tensor(
-                            [[-1.0, -1.0, 1.0]]
-                            * 16  # Replicate the relationship across all 16 neurons
-                        )
-                    )
-                    model[0].bias.copy_(
-                        torch.zeros(16)
-                    )  # Zero bias for the first layer
+        # # Initialize weights and biases
+        # with torch.no_grad():
+        #     # Weights for the `linear` models
+        #     if kwargs["model_type"] == "linear":
+        #         for model in self.models:
+        #             model.weight.copy_(
+        #                 torch.tensor([[-1.0, -1.0, 1.0]])
+        #             )  # Shape: [1, 3]
+        #             model.bias.copy_(torch.tensor([0.0]))  # Shape: [1]
 
-                    # Second layer weights: Shape [1, 16]
-                    model[2].weight.copy_(
-                        torch.ones(1, 16)  # Equal contribution from all 16 features
-                    )
-                    model[2].bias.copy_(
-                        torch.tensor([0.0])
-                    )  # Zero bias for the second layer
+        #     # Weights for the `mlp` models
+        #     elif kwargs["model_type"] == "mlp":
+        #         for model in self.models:
+        #             # First layer weights: Shape [16, 3]
+        #             model[0].weight.copy_(
+        #                 torch.tensor(
+        #                     [[-1.0, -1.0, 1.0]]
+        #                     * 16  # Replicate the relationship across all 16 neurons
+        #                 )
+        #             )
+        #             model[0].bias.copy_(
+        #                 torch.zeros(16)
+        #             )  # Zero bias for the first layer
+
+        #             # Second layer weights: Shape [1, 16]
+        #             model[2].weight.copy_(
+        #                 torch.ones(1, 16)  # Equal contribution from all 16 features
+        #             )
+        #             model[2].bias.copy_(
+        #                 torch.tensor([0.0])
+        #             )  # Zero bias for the second layer
 
     def reset(self):
         super().reset()

@@ -3,7 +3,9 @@
 set -e
 
 # Use env vars if they exist, otherwise set defaults
-: "${HF:=Qwen/Qwen2-1.5B-Instruct}"
+# : "${HF:=Qwen/Qwen2-1.5B-Instruct}"
+: "${HF:=Qwen/Qwen2-0.5B-Instruct}"
+
 
 # Export the variables
 export HF
