@@ -38,7 +38,7 @@ signal.signal(signal.SIGINT, handle_sigint)
 sys.excepthook = handle_uncaught_exception
 
 # Configuration
-CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
+CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth")
 TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
 DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
 BATCH_SIZE = 1
