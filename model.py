@@ -500,13 +500,13 @@ class Attention(nn.Module):
             scaling_factors = scaling_factors[:, : v.size(2), :]
             scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
 
-            v = v * scaling_factors
+            v_scaled = v * scaling_factors
             if torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
                 print(f"[DEBUG] Rank {rank} applying scaling of")
 
             # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-            v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v_rep = v_scaled.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
             y, attn = scaled_dot_product_attention(
                 q,

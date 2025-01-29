@@ -16,7 +16,7 @@ import torch._inductor.config
 from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
-from tokenizer import get_tokenizer, encode, TokenizersChatFormat
+from tokenizer import get_tokenizer, TokenizersChatFormat
 
 from generation_utils import (
     load_model,
@@ -38,12 +38,12 @@ signal.signal(signal.SIGINT, handle_sigint)
 sys.excepthook = handle_uncaught_exception
 
 # Configuration
-CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
+CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth")
 TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
 DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
 BATCH_SIZE = 1
 EPOCHS = 3
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 5e-6
 BLOCK_SIZE = 128
 MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
@@ -58,7 +58,6 @@ if not TOKENIZER_PATH.is_file():
 
 # Load model
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# pdb.set_trace()
 rank = maybe_init_dist()
 print("Rank: ", rank)
 use_tp = rank is not None
@@ -82,14 +81,6 @@ print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
 # Load tokenizer
 tokenizer_ultrachat = get_tokenizer(TOKENIZER_PATH, CHECKPOINT_PATH, is_chat=IS_CHAT)
-
-# # Define the cache strategy and related configurations
-# cache_strategy = ["lightweight"] * len(
-#     model.layers
-# )  # Example: lightweight for all layers
-# max_cache_length = [MAX_SEQ_LENGTH] * len(model.layers)
-# recent_window = [32] * len(model.layers)
-# prompt_compression_strategy = ["none"] * len(model.layers)
 
 # # copied from the generation kwargs
 # cache_kwargs = {
@@ -146,7 +137,6 @@ setup_caches(
 
 
 # Load dataset
-# Dataset Preparation
 class PromptIterableDataset(IterableDataset):
     def __init__(
         self,
@@ -177,13 +167,9 @@ class PromptIterableDataset(IterableDataset):
         Tokenizes a single example using the chat tokenizer's encoding method.
         """
         # Use the chat tokenizer to encode the dialog
-        dialog = example["messages"]  # Assumes "messages" contains the list of messages
+        dialog = example["messages"]
         tokenized_ids = self.tokenizer.encode_dialog_prompt(dialog)
-
-        # Convert to a tensor
         tokenized_ids = torch.tensor(tokenized_ids, dtype=torch.long)
-
-        # Create labels for teacher forcing
         labels = tokenized_ids.clone()
 
         # Compute masking indices for user tokens
@@ -202,7 +188,6 @@ class PromptIterableDataset(IterableDataset):
                         current_token_position : current_token_position + message_length
                     ] = IGNORE_INDEX
 
-                # Update token position
                 current_token_position += message_length
 
         return {
@@ -256,16 +241,12 @@ train_dataset = PromptIterableDataset(
 )
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
 
-# for name, param in model.named_parameters():
-#     print(name)
 for name, param in model.named_parameters():
     print(name)
     if "attention.kv_cache.models" in name:
         param.requires_grad = True
     else:
         param.requires_grad = False
-
-# pdb.set_trace()
 
 # Optimizer
 optimizer = AdamW(model.get_lightweight_params(), lr=LEARNING_RATE)
@@ -277,16 +258,15 @@ model.train()
 model.set_train_mode(True)
 for epoch in range(EPOCHS):
     total_loss = 0
-    # pdb.set_trace()
     for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}"):
         batch = {
             key: value.to(DEVICE) if torch.is_tensor(value) else value
             for key, value in batch.items()
         }
-        input_ids = batch["input_ids"]  # Inputs
-        labels = batch["labels"]  # Targets
-        labels = labels[:, 1:]  # Remove the first token to align with logits
-        labels = labels.reshape(-1)  # Flatten to match logits shape
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        labels = labels[:, 1:]  # Remove the first token
+        labels = labels.reshape(-1)
 
         # Input positions and prefill flags
         prompt_length = input_ids.size(1)
@@ -300,17 +280,18 @@ for epoch in range(EPOCHS):
         )
         # Forward pass
         optimizer.zero_grad()
+        torch.autograd.set_detect_anomaly(True)
         logits = model(
             input_ids, input_pos, mask=causal_mask, is_prefill=True
         )  # prefill = true for training on full sequence
-        pdb.set_trace()
+
         # Loss computation
         logits = logits[:, :-1].reshape(-1, logits.size(-1))
         labels = labels.reshape(-1)
         loss_epoch = loss(logits, labels)
 
         # Backward pass
-        loss_epoch.backward()  # out of memory error
+        loss_epoch.backward()
 
         optimizer.step()
 
@@ -323,7 +304,8 @@ for epoch in range(EPOCHS):
 # Save the model
 def save_model_weights(model, kwargs):
     # Extract model name and type from kwargs
-    model_name = kwargs.get("checkpoint_path", "default_model").stem
+    checkpoint_path = kwargs.get("checkpoint_path", "default_model")
+    model_name = Path(checkpoint_path).parent.name
     model_type = kwargs.get("model_type", "unknown")
 
     # Generate a timestamp for the save file
@@ -337,11 +319,50 @@ def save_model_weights(model, kwargs):
 
     save_path = save_dir / f"{timestamp}_{model_type}.pth"
 
-    # Save the model state_dict
-    torch.save(model.state_dict(), save_path)
+    # Filter and save only the parameters with requires_grad=True
+    trained_weights = {
+        name: param
+        for name, param in model.state_dict().items()
+        if name in [n for n, p in model.named_parameters() if p.requires_grad]
+    }
+    torch.save(trained_weights, save_path)
 
-    print(f"Model saved to {save_path}")
+    print(f"Trained weights saved to {save_path}")
+
+    return save_path
 
 
-save_model_weights(model, cache_kwargs)
+def load_trained_weights(model, checkpoint_path):
+    """
+    Load trained weights into a model, updating only matching layers.
+
+    Args:
+        model (torch.nn.Module): The model to load weights into.
+        checkpoint_path (str or Path): Path to the saved weights (e.g., lightweight weights).
+    """
+    # Load the trained weights from the checkpoint
+    trained_weights = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    # Get the current model's state dict
+    model_state = model.state_dict()
+
+    # Filter weights that match the model's parameters
+    matched_weights = {k: v for k, v in trained_weights.items() if k in model_state}
+
+    # Check for mismatches (optional debugging)
+    unmatched_weights = set(trained_weights.keys()) - set(model_state.keys())
+    if unmatched_weights:
+        print(
+            f"Warning: The following weights were not found in the model: {unmatched_weights}"
+        )
+
+    # Update the model's parameters with the matched weights
+    model_state.update(matched_weights)
+    model.load_state_dict(model_state)
+
+    print(f"Loaded trained weights from {checkpoint_path}")
+
+
+save_path = save_model_weights(model, cache_kwargs)
+load_trained_weights(model, save_path)
 dist.destroy_process_group()

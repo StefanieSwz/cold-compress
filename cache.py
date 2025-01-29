@@ -1185,9 +1185,11 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
             # Save norms and attention scores only for valid prompt length
             seq_len = attn.shape[-1]
-            self.attn_scores[:, :, :seq_len] = attn
-            self.key_norm[:, :, :seq_len] = key_norm
-            self.value_norm[:, :, :seq_len] = value_norm
+            self.attn_scores[:, :, :seq_len] = attn.detach()
+            self.key_norm[:, :, :seq_len] = key_norm.detach()
+            self.value_norm[:, :, :seq_len] = (
+                value_norm.detach()
+            )  # detatching as othervise gradient is reused after release
         else:
             # Generation phase: compute and update only new key and value norms, but full attention scores
             current_pos = input_pos.item()  # Position of the current token
@@ -1222,7 +1224,6 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         Returns:
             torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
         """
-        # pdb.set_trace()
         seq_len = input_pos.int()  # Current sequence length
 
         # Extract features for the current sequence length
