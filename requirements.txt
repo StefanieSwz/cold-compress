@@ -1,5 +1,8 @@
 # torch==2.5.0.dev20240723+cu121
 # pytorch-triton==3.0.0+dedb7bdf33
+# pip3 install torch --index-url https://download.pytorch.org/whl/cu126  
+# torch==2.5.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+# pytorch-triton==3.0.0+dedb7bdf33 --index-url https://download.pytorch.org/whl/nightly/pytorch-triton/
 absl-py
 accelerate
 bert-score
@@ -18,4 +21,5 @@ safetensors
 scikit-learn
 sentencepiece
 tiktoken
+python-dotenv
 git+https://github.com/google-research/bleurt.git

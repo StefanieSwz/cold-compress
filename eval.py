@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional, List
 from collections import defaultdict, Counter
 from tqdm.auto import tqdm
+from dotenv import load_dotenv
 
 import torch
 import torch._dynamo.config
@@ -57,6 +58,8 @@ sys.path.append(str(wd))
 from tokenizer import get_tokenizer
 from generation_utils import load_model, generate
 from task import TASK_MAPPING, AutoTask
+
+load_dotenv()
 
 
 def flatten_dict(in_dict: dict) -> dict:
@@ -121,9 +124,12 @@ def args_to_str(args):
         "__".join(
             sorted(
                 [
-                    f"{k}=" + ",".join(compress_list([str(process_num(m)) for m in v]))
-                    if type(v) == list
-                    else f"{k}={process_num(v)}"
+                    (
+                        f"{k}="
+                        + ",".join(compress_list([str(process_num(m)) for m in v]))
+                        if type(v) == list
+                        else f"{k}={process_num(v)}"
+                    )
                     for k, v in args_dict.items()
                     if k in RELEVANT_CACHE_KWARGS
                 ]

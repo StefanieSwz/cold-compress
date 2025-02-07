@@ -17,6 +17,7 @@ from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
+from cache import save_lightweight, load_trained_lightweight
 
 from generation_utils import (
     load_model,
@@ -301,68 +302,6 @@ for epoch in range(EPOCHS):
     print(f"Epoch {epoch + 1}/{EPOCHS} completed. Average Loss: {avg_loss:.4f}")
 
 
-# Save the model
-def save_model_weights(model, kwargs):
-    # Extract model name and type from kwargs
-    checkpoint_path = kwargs.get("checkpoint_path", "default_model")
-    model_name = Path(checkpoint_path).parent.name
-    model_type = kwargs.get("model_type", "unknown")
-
-    # Generate a timestamp for the save file
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    # Define the save directory and file path
-    save_dir = Path(f"./lightweight_weights/{model_name}")
-    save_dir.mkdir(
-        parents=True, exist_ok=True
-    )  # Create the directory if it doesn't exist
-
-    save_path = save_dir / f"{timestamp}_{model_type}.pth"
-
-    # Filter and save only the parameters with requires_grad=True
-    trained_weights = {
-        name: param
-        for name, param in model.state_dict().items()
-        if name in [n for n, p in model.named_parameters() if p.requires_grad]
-    }
-    torch.save(trained_weights, save_path)
-
-    print(f"Trained weights saved to {save_path}")
-
-    return save_path
-
-
-def load_trained_weights(model, checkpoint_path):
-    """
-    Load trained weights into a model, updating only matching layers.
-
-    Args:
-        model (torch.nn.Module): The model to load weights into.
-        checkpoint_path (str or Path): Path to the saved weights (e.g., lightweight weights).
-    """
-    # Load the trained weights from the checkpoint
-    trained_weights = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-
-    # Get the current model's state dict
-    model_state = model.state_dict()
-
-    # Filter weights that match the model's parameters
-    matched_weights = {k: v for k, v in trained_weights.items() if k in model_state}
-
-    # Check for mismatches (optional debugging)
-    unmatched_weights = set(trained_weights.keys()) - set(model_state.keys())
-    if unmatched_weights:
-        print(
-            f"Warning: The following weights were not found in the model: {unmatched_weights}"
-        )
-
-    # Update the model's parameters with the matched weights
-    model_state.update(matched_weights)
-    model.load_state_dict(model_state)
-
-    print(f"Loaded trained weights from {checkpoint_path}")
-
-
-save_path = save_model_weights(model, cache_kwargs)
-load_trained_weights(model, save_path)
+save_path = save_lightweight(model, cache_kwargs)
+load_trained_lightweight(model, save_path)
 dist.destroy_process_group()

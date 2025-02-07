@@ -12,6 +12,7 @@ import argparse
 import yaml
 from model import Transformer, find_multiple
 from tokenizer import TokenizerInterface
+from cache import load_trained_lightweight
 
 default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -384,7 +385,10 @@ def setup_caches(
 
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)
-
+        if cache_kwargs["cache_strategy"][0] == "lightweight":
+            file = Path(cache_kwargs.pop("trained_weights"))
+            if file.exists() and file.is_file():
+                load_trained_lightweight(model, file)
     return cache_kwargs
 
 

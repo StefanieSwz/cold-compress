@@ -176,7 +176,9 @@ class LLMRouge(Metric):
         self.num_retries = num_retries
 
     def _load_metric(self, **kwargs):
-        name = kwargs.get("name", "haiku")
+        name = kwargs.get(
+            "name", "haiku"
+        )  # haiku got a new version, specified now "claude-3-5-haiku-20241022"
         matching_names = [m for m in models if name in m]
         assert len(matching_names) > 0, f"Model name {name} not found in {models}"
         assert (

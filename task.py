@@ -2,6 +2,7 @@ import random
 from abc import ABC, abstractmethod
 from string import ascii_uppercase
 from pathlib import Path
+import logging
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,8 @@ from datasets import load_dataset
 
 from metric import AutoMetric
 from tokenizer import get_tokenizer
+
+logging.basicConfig(level=logging.INFO)  # Set logging level
 
 
 class EvaluationTask(ABC):
@@ -66,13 +69,13 @@ class EvaluationTask(ABC):
                 lambda x: len(self.tokenizer(x["prompt"])) + self.max_tokens
                 <= self.model_max_length
             )
-            print(
+            logging.info(
                 f"Filtered {len(split_data) - len(filtered_data)} examples from split {split}"
             )
 
             if self.num_samples > 0 and len(filtered_data) > self.num_samples:
                 n = min(self.num_samples, len(filtered_data))
-                print(f"Randomly sample {n} examples")
+                logging.info(f"Randomly sample {n} examples")
                 # Use a fixed seed for reproducibility
                 inds = random.Random(n).sample(range(len(filtered_data)), n)
                 filtered_data = filtered_data.select(inds)
@@ -93,8 +96,8 @@ class EvaluationTask(ABC):
 
     def compute_metrics(self, predictions, split, dataset):
         assert self.is_ready[split], f"Split {split} has not been processed yet."
-        assert (
-            len(dataset) == len(predictions)
+        assert len(dataset) == len(
+            predictions
         ), f"Number of predictions and labels must match ({len(predictions)} != {len(dataset)})."
         return self._compute_metrics(dataset["prompt"], predictions, dataset["labels"])
 
@@ -755,6 +758,156 @@ NOTE: You should only predict the next line in the current file. Do not produce 
         }
 
 
+class UltraChatTask(EvaluationTask):
+    DEFAULT_PROMPT_TEMPLATE = """You are given a chat dialog. Your task is to generate a response based on the previous conversation.
+
+====CHAT HISTORY====
+{chat_history}
+
+====YOUR RESPONSE===="""
+    RAW_PROMPT_TEMPLATE = """{chat_history}"""
+    train_split: str = "train_gen"
+    validation_split: str = "val_gen"  # not originally in HF dataset
+    test_split: str = "test_gen"
+    # mandatory_cols = ["messages"]
+
+    def __init__(
+        self,
+        prompt_template=RAW_PROMPT_TEMPLATE,
+        max_tokens=512,
+        tokenizer=None,
+        **kwargs,
+    ):
+        super().__init__(
+            prompt_template,
+            max_tokens,
+            tokenizer=tokenizer,
+            hf_args=["HuggingFaceH4/ultrachat_200k"],
+            **kwargs,
+        )
+
+        self.metrics = {
+            "BertScore": AutoMetric.from_name("bertscore"),
+            "Rouge": AutoMetric.from_name("rouge"),
+            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
+            "LLM-Judge": AutoMetric.from_name("llm-as-a-judge"),
+        }
+        # self.requires_perplexity = True
+
+    def get_split(self, split):
+        remove_cols = [
+            col
+            for col in self.dataset[split].column_names
+            if col not in self.mandatory_cols
+        ]
+        split_name = split
+        if split == "val_gen":
+            split_name = "train_gen"
+        if not self.is_ready[split_name]:
+            split_data = self.dataset[split_name]
+            if split == "test_gen":
+                split_data = split_data.select(
+                    range(min(len(split_data), 100))
+                )  # Limit to 100 rows
+
+            elif split != "test_gen":  # Train-validation split logic
+                total_size = len(split_data)
+
+                train_size = int(0.7 * total_size)
+                train_indices = list(range(train_size))
+                val_indices = list(range(train_size, total_size))
+
+                if split == "train_gen":
+                    split_data = split_data.select(train_indices)
+                else:
+                    split_data = split_data.select(val_indices)
+
+            split_data = split_data.map(
+                self.prepare_batch, batched=True, remove_columns=remove_cols
+            )
+
+            # Filter out examples that could be too long for the model
+            filtered_data = split_data.filter(
+                lambda x: len(self.tokenizer(x["prompt"])) + self.max_tokens
+                <= self.model_max_length
+            )
+            logging.info(
+                f"Filtered {len(split_data) - len(filtered_data)} examples from split {split}"
+            )
+
+            if self.num_samples > 0 and len(filtered_data) > self.num_samples:
+                n = min(self.num_samples, len(filtered_data))
+                logging.info(f"Randomly sample {n} examples")
+                # Use a fixed seed for reproducibility
+                inds = random.Random(n).sample(range(len(filtered_data)), n)
+                filtered_data = filtered_data.select(inds)
+
+            self.dataset[split] = filtered_data
+            self.is_ready[split] = True
+
+        return self.dataset[split]
+
+    # def prepare_row(self, row):
+    #     """
+    #     Processes a single chat row using only the first user message as the prompt
+    #     and the first assistant response as the label.
+    #     """
+    #     messages = row["messages"]  # Extract chat messages
+
+    #     if len(messages) < 2:
+    #         raise ValueError(
+    #             "Each row must contain at least one user and one assistant message."
+    #         )
+
+    #     assistant_response = messages[1]
+
+    #     # Ensure correct roles
+    #     if assistant_response["role"] != "assistant":
+    #         raise ValueError(
+    #             "Expected first message to be from user and second from assistant."
+    #         )
+    #     prompt = self.prompt_template.format(repo=row["prompt"])
+    #     return {
+    #         "prompt": prompt,
+    #         "context": prompt,  # Context is just the user input
+    #         "question": None,  # No explicit question in a chat dataset
+    #         "labels": assistant_response[
+    #             "content"
+    #         ],  # Assistant's first response is the label
+    #     }
+
+    def prepare_row(self, row):
+        """
+        Processes a single chat row to create multiple training examples.
+        Each example includes the conversation history up to an assistant response.
+        """
+        messages = row["messages"]  # Extract chat messages
+        chat_history = []  # Store formatted chat history
+        processed_examples = []  # Store multiple training examples
+
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+            chat_history.append(f"{role.capitalize()}: {content}")
+
+            # Every time we reach an assistant response, create a new training example
+            if role == "assistant":
+                prompt = self.prompt_template.format(
+                    chat_history="\n".join(chat_history[:-1])
+                )
+
+                processed_examples.append(
+                    {
+                        "prompt": prompt,
+                        "context": prompt,  # Context includes previous messages
+                        "question": None,  # No explicit question
+                        "labels": content,  # Assistant's response as the label
+                    }
+                )
+
+        return processed_examples  # Returns a list of training examples
+
+
 TASK_MAPPING = {
     "dolomites": Dolomites,
     "musique": Musique,
@@ -769,6 +922,7 @@ TASK_MAPPING = {
     "squality": Squality,
     "triviaqa": TriviaQA,
     "truthfulqa": TruthfulQA,
+    "ultrachat": UltraChatTask,
 }
 
 
@@ -833,7 +987,7 @@ if __name__ == "__main__":
     if args.compute_stats:
         stats = []
         for task_name in TASK_MAPPING.keys():
-            print(f"Computing stats for {task_name}")
+            logging.info(f"Computing stats for {task_name}")
             task = AutoTask.from_name(task_name, **task_kwargs)
             test = task.get_test()
 
@@ -876,25 +1030,25 @@ if __name__ == "__main__":
     else:
         task = AutoTask.from_name(args.task, **task_kwargs)
         test = task.get_test()
-        print("Example test datapoint:\n\n")
+        logging.info("Example test datapoint:\n\n")
         ex = test[0]
         for k, v in ex.items():
-            print(f"{k}:\n{v}\n\n")
+            logging.info(f"{k}:\n{v}\n\n")
 
         train_predictions = ["This is a train prediction"] * len(task.dataset["train"])
         test_predictions = ["This is a test prediction"] * len(test)
 
-        print("A 'not ready' error should be displayed below:\n\n")
+        logging.info("A 'not ready' error should be displayed below:\n\n")
         try:
             task.train_metrics(predictions=train_predictions)
         except Exception as e:
-            print(e)
+            logging.info(e)
 
-        print("A 'length mismatch' error should be displayed below:\n\n")
+        logging.info("A 'length mismatch' error should be displayed below:\n\n")
         try:
             task.test_metrics(predictions=test_predictions[:-1])
         except Exception as e:
-            print(e)
+            logging.info(e)
 
-        print("Dummy metrics for test split:\n\n")
-        print(task.test_metrics(predictions=test_predictions))
+        logging.info("Dummy metrics for test split:\n\n")
+        logging.info(task.test_metrics(predictions=test_predictions))
