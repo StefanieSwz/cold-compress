@@ -39,13 +39,12 @@ signal.signal(signal.SIGINT, handle_sigint)
 sys.excepthook = handle_uncaught_exception
 
 # Configuration
-CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth")
+CHECKPOINT_PATH = Path("./checkpoints/meta-llama/Meta-Llama-3.1-8B-Instruct/model.pth")
 TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
 DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
 BATCH_SIZE = 1
-EPOCHS = 3
+EPOCHS = 10
 LEARNING_RATE = 5e-6
-BLOCK_SIZE = 128
 MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
 
@@ -88,7 +87,7 @@ tokenizer_ultrachat = get_tokenizer(TOKENIZER_PATH, CHECKPOINT_PATH, is_chat=IS_
 #     # "prompt": "What is a cold compress?",
 #     "max_new_tokens": 512,
 #     "cache_config": None,
-#     "checkpoint_path": Path("checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth"),
+#     "checkpoint_path": CEHCKPOINT_PATH,
 #     "profile": None,
 #     "compile": False,
 #     "device": "cuda",
@@ -112,7 +111,7 @@ cache_kwargs = {
     # "prompt": "What is a cold compress?",
     "max_new_tokens": 512,
     "cache_config": None,
-    "checkpoint_path": Path("checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth"),
+    "checkpoint_path": CHECKPOINT_PATH,
     "profile": None,
     "compile": False,
     "device": "cuda",
@@ -123,12 +122,12 @@ cache_kwargs = {
     "cache_strategy": ["lightweight"],
     "cache_strategy_pattern": "tile",
     "feed_long_prompts": False,
-    "prompt_compression_strategy": ["full"],
+    "prompt_compression_strategy": ["l2"],
     "global_tokens": 1,
     "recent_window": 10,
     "history_window_size": 1,
     "attn_thresholding": False,
-    "model_type": "linear",
+    "model_type": "mlp",
     "min_recovery_frac": 0.9,
 }
 
@@ -176,20 +175,17 @@ class PromptIterableDataset(IterableDataset):
         # Compute masking indices for user tokens
         current_token_position = 0  # Track token positions
         for i, message in enumerate(dialog):
-            if (
-                i < 2
-            ):  # for memory reasons, only consider the first 2 messages, prompt and assistant
-                # Get tokenized length of the current message
-                message_tokens = self.tokenizer.encode_dialog_prompt([message])
-                message_length = len(message_tokens)
+            # Get tokenized length of the current message
+            message_tokens = self.tokenizer.encode_dialog_prompt([message])
+            message_length = len(message_tokens)
 
-                if message["role"] == "user":
-                    # Mask user message tokens
-                    labels[
-                        current_token_position : current_token_position + message_length
-                    ] = IGNORE_INDEX
+            if message["role"] == "user":
+                # Mask user message tokens
+                labels[
+                    current_token_position : current_token_position + message_length
+                ] = IGNORE_INDEX
 
-                current_token_position += message_length
+            current_token_position += message_length
 
         return {
             "input_ids": tokenized_ids,
@@ -303,5 +299,4 @@ for epoch in range(EPOCHS):
 
 
 save_path = save_lightweight(model, cache_kwargs)
-load_trained_lightweight(model, save_path)
-dist.destroy_process_group()
+print(f"Model saved to {save_path}")
