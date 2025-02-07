@@ -128,7 +128,7 @@ cache_kwargs = {
     "history_window_size": 1,
     "attn_thresholding": False,
     "model_type": "mlp",
-    "trained_weights": None,
+    "trained_weights": "none",
     "min_recovery_frac": 0.9,
 }
 
