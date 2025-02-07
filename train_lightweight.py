@@ -233,7 +233,7 @@ class PromptIterableDataset(IterableDataset):
 
 ultrachat_datadic = load_dataset(DATASET_PATH)
 train_dataset = PromptIterableDataset(
-    ultrachat_datadic["train_gen"].select(range(10)),
+    ultrachat_datadic["train_gen"].select(range(1000)),
     tokenizer_ultrachat,
     MAX_SEQ_LENGTH,
 )
