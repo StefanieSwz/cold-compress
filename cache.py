@@ -166,14 +166,11 @@ def create_window_attention_mask(seq_len, window_size, device, global_tokens: in
     return mask
 
 
-def save_lightweight(model, kwargs):
+def save_lightweight(model, kwargs, identifier):
     # Extract model name and type from kwargs
     checkpoint_path = kwargs.get("checkpoint_path", "default_model")
     model_name = Path(checkpoint_path).parent.name
     model_type = kwargs.get("model_type", "unknown")
-
-    # Generate a timestamp for the save file
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Define the save directory and file path
     save_dir = Path(f"./lightweight_weights/{model_name}")
@@ -181,7 +178,7 @@ def save_lightweight(model, kwargs):
         parents=True, exist_ok=True
     )  # Create the directory if it doesn't exist
 
-    save_path = save_dir / f"{timestamp}_{model_type}.pth"
+    save_path = save_dir / f"{identifier}_{model_type}.pth"
 
     # Filter and save only the parameters with requires_grad=True
     trained_weights = {

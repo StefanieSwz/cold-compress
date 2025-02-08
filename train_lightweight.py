@@ -43,8 +43,8 @@ CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
 TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
 DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
 BATCH_SIZE = 1
-EPOCHS = 10
-LEARNING_RATE = 5e-6
+EPOCHS = 5
+LEARNING_RATE = 3e-6
 MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
 
@@ -251,6 +251,8 @@ optimizer = AdamW(model.get_lightweight_params(), lr=LEARNING_RATE)
 loss = nn.CrossEntropyLoss()
 
 # Training Loop
+# Generate a timestamp for the save file
+timestamp = time.strftime("%Y%m%d_%H%M%S")
 print("Starting training...")
 model.train()
 model.set_train_mode(True)
@@ -297,7 +299,7 @@ for epoch in range(EPOCHS):
 
     avg_loss = total_loss / len(train_loader)
     print(f"Epoch {epoch + 1}/{EPOCHS} completed. Average Loss: {avg_loss:.4f}")
-
-
-save_path = save_lightweight(model, cache_kwargs)
-print(f"Model saved to {save_path}")
+    save_path = save_lightweight(
+        model, cache_kwargs, timestamp
+    )  # override weights each epoch
+    print(f"Model saved to {save_path}")
