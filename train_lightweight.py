@@ -2,14 +2,12 @@ import os
 import sys
 import time
 import signal
-import pdb
-from typing import *
+from typing import Any, Dict, List, Optional, Iterator, Union
 from pathlib import Path
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import torch._dynamo.config
 import torch._inductor.config
@@ -17,7 +15,7 @@ from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
-from cache import save_lightweight, load_trained_lightweight
+from cache import save_lightweight
 
 from generation_utils import (
     load_model,
@@ -39,6 +37,7 @@ signal.signal(signal.SIGINT, handle_sigint)
 sys.excepthook = handle_uncaught_exception
 
 # Configuration
+# TODO: Support terminal arguments via argparse
 CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
 TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
 DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
@@ -47,6 +46,151 @@ EPOCHS = 5
 LEARNING_RATE = 3e-6
 MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
+
+
+class PromptIterableDataset(IterableDataset):
+    """
+    A dataset wrapper that iterates over a raw dataset, tokenizes each example using a chat-format tokenizer,
+    and truncates the tokenized sequences to a maximum sequence length. This dataset is iterable and supports
+    teacher forcing, assuming that each example contains a dialogue with multiple messages.
+
+    Attributes:
+        raw_dataset (Dataset): The raw dataset containing examples with a "messages" field.
+        tokenizer (TokenizersChatFormat): The tokenizer used for encoding dialog prompts.
+        max_seq_length (int): The maximum sequence length for tokenized examples.
+    """
+
+    def __init__(
+        self,
+        raw_dataset: Dataset,
+        tokenizer: TokenizersChatFormat,
+        max_seq_length: Optional[int] = 512,
+    ):
+        """
+        Initialize the PromptIterableDataset.
+
+        Args:
+            raw_dataset (Dataset): The raw dataset, which must support both iteration and length queries.
+            tokenizer (TokenizersChatFormat): A tokenizer with a method `encode_dialog_prompt` for encoding chat dialogs.
+            max_seq_length (Optional[int], optional): Maximum length of the tokenized sequence. Defaults to 512.
+
+        Raises:
+            AssertionError: If raw_dataset does not have __iter__ or __len__ methods.
+        """
+        assert hasattr(
+            raw_dataset, "__iter__"
+        ), f"The dataset must have __iter__ method. Dataset is {raw_dataset}"
+        assert hasattr(
+            raw_dataset, "__len__"
+        ), f"The dataset must have __len__ method. Dataset is {raw_dataset}"
+
+        self.raw_dataset = raw_dataset
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+
+    def tokenize_example(self, example: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        Tokenizes a single example using the chat tokenizer's encoding method.
+
+        The method encodes the dialog present in the "messages" field of the example,
+        creates a tensor of token IDs, and then masks out user message tokens by setting
+        them to IGNORE_INDEX.
+
+        Args:
+            example (Dict[str, Any]): A dictionary representing a chat example with a "messages" key.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary with keys "input_ids" and "labels" containing tokenized tensors.
+        """
+        dialog = example["messages"]
+        tokenized_ids = self.tokenizer.encode_dialog_prompt(dialog)
+        tokenized_ids = torch.tensor(tokenized_ids, dtype=torch.long)
+        labels = tokenized_ids.clone()
+
+        current_token_position = 0
+        for message in dialog:
+            message_tokens = self.tokenizer.encode_dialog_prompt([message])
+            message_length = len(message_tokens)
+
+            if message["role"] == "user":
+                labels[
+                    current_token_position : current_token_position + message_length
+                ] = IGNORE_INDEX
+
+            current_token_position += message_length
+
+        return {
+            "input_ids": tokenized_ids,
+            "labels": labels,
+        }
+
+    def truncate(
+        self, tokenized_example: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Truncates tokenized examples to the maximum sequence length.
+
+        If the length of the "input_ids" exceeds max_seq_length, each field in the tokenized_example
+        is truncated from the tail to ensure the length does not exceed max_seq_length.
+
+        Args:
+            tokenized_example (Dict[str, torch.Tensor]): A dictionary containing tokenized data with key "input_ids".
+
+        Returns:
+            Dict[str, torch.Tensor]: The tokenized example truncated to max_seq_length.
+        """
+        old_len = len(tokenized_example["input_ids"])
+        if old_len > self.max_seq_length:
+            for k in tokenized_example:
+                tokenized_example[k] = tokenized_example[k][
+                    : -(old_len - self.max_seq_length)
+                ]
+        return tokenized_example
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """
+        Iterates over the raw dataset and yields tokenized and truncated examples.
+
+        Yields:
+            Iterator[Dict[str, torch.Tensor]]: An iterator over processed examples.
+        """
+        for example in self.raw_dataset:
+            tokenized_example = self.tokenize_example(example)
+            tokenized_example = self.truncate(tokenized_example)
+            yield tokenized_example
+
+    def __len__(self) -> int:
+        """
+        Returns the number of examples in the raw dataset.
+
+        Returns:
+            int: The length of the raw dataset.
+        """
+        return len(self.raw_dataset)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """
+        Get a specific item by index from the raw dataset.
+
+        Note: This method requires that the raw_dataset supports indexing via __getitem__.
+
+        Args:
+            index (int): The index of the example to retrieve.
+
+        Raises:
+            TypeError: If the raw_dataset does not support indexing.
+
+        Returns:
+            Dict[str, torch.Tensor]: The tokenized and truncated example at the given index.
+        """
+        # Ensure the raw_dataset supports indexing
+        if not hasattr(self.raw_dataset, "__getitem__"):
+            raise TypeError("raw_dataset must support indexing to use __getitem__.")
+
+        example = self.raw_dataset[index]
+        tokenized_example = self.tokenize_example(example)
+        tokenized_example = self.truncate(tokenized_example)
+        return tokenized_example
 
 
 assert CHECKPOINT_PATH.is_file(), CHECKPOINT_PATH
@@ -75,40 +219,13 @@ IS_CHAT = (
 print("Loading model ...")
 t0 = time.time()
 model = load_model(CHECKPOINT_PATH, DEVICE, PRECISION, use_tp)
-print("Model Type:", model.__class__.__name__)
 device_sync(device=DEVICE)  # MKG
 print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
 # Load tokenizer
 tokenizer_ultrachat = get_tokenizer(TOKENIZER_PATH, CHECKPOINT_PATH, is_chat=IS_CHAT)
 
-# # copied from the generation kwargs
-# cache_kwargs = {
-#     # "prompt": "What is a cold compress?",
-#     "max_new_tokens": 512,
-#     "cache_config": None,
-#     "checkpoint_path": CEHCKPOINT_PATH,
-#     "profile": None,
-#     "compile": False,
-#     "device": "cuda",
-#     "attn_top_k": 1.0,
-#     "max_cache_length": [1.0],
-#     "cache_bits": None,
-#     "cache_length_pattern": "tile",
-#     "cache_strategy": ["lightweight"],
-#     "cache_strategy_pattern": "tile",
-#     "feed_long_prompts": False,
-#     "prompt_compression_strategy": ["full"],
-#     "global_tokens": 1,
-#     "recent_window": 10,
-#     "history_window_size": 1,
-#     "attn_thresholding": False,
-#     "model_type": "linear",
-#     "min_recovery_frac": 0.9,
-# }
-
 cache_kwargs = {
-    # "prompt": "What is a cold compress?",
     "max_new_tokens": 512,
     "cache_config": None,
     "checkpoint_path": CHECKPOINT_PATH,
@@ -132,104 +249,7 @@ cache_kwargs = {
     "min_recovery_frac": 0.9,
 }
 
-setup_caches(
-    model, tokenizer_ultrachat, DEVICE, MAX_SEQ_LENGTH, cache_kwargs
-)  # access compression technique
-
-
-# Load dataset
-class PromptIterableDataset(IterableDataset):
-    def __init__(
-        self,
-        raw_dataset: Dataset,
-        tokenizer: TokenizersChatFormat,
-        max_seq_length: Optional[int] = 512,
-        teacher_forcing: Optional[bool] = True,
-        truncate_method: Optional[str] = "tail",
-    ):
-        assert hasattr(
-            raw_dataset, "__iter__"
-        ), f"The dataset must have __iter__ method. Dataset is {raw_dataset}"
-        assert hasattr(
-            raw_dataset, "__len__"
-        ), f"The dataset must have __len__ method. Dataset is {raw_dataset}"
-
-        self.raw_dataset = raw_dataset
-        self.teacher_forcing = teacher_forcing
-        assert self.teacher_forcing, "Teacher forcing must be enabled."
-
-        self.tokenizer = tokenizer
-        self.truncate_method = truncate_method
-        self.max_seq_length = max_seq_length
-        assert self.truncate_method == "tail", "Only tail truncation is supported."
-
-    def tokenize_example(self, example):
-        """
-        Tokenizes a single example using the chat tokenizer's encoding method.
-        """
-        # Use the chat tokenizer to encode the dialog
-        dialog = example["messages"]
-        tokenized_ids = self.tokenizer.encode_dialog_prompt(dialog)
-        tokenized_ids = torch.tensor(tokenized_ids, dtype=torch.long)
-        labels = tokenized_ids.clone()
-
-        # Compute masking indices for user tokens
-        current_token_position = 0  # Track token positions
-        for i, message in enumerate(dialog):
-            # Get tokenized length of the current message
-            message_tokens = self.tokenizer.encode_dialog_prompt([message])
-            message_length = len(message_tokens)
-
-            if message["role"] == "user":
-                # Mask user message tokens
-                labels[
-                    current_token_position : current_token_position + message_length
-                ] = IGNORE_INDEX
-
-            current_token_position += message_length
-
-        return {
-            "input_ids": tokenized_ids,
-            "labels": labels,
-        }
-
-    def truncate(self, tokenized_example):
-        """
-        Truncates tokenized examples to the maximum sequence length.
-        """
-        old_len = len(tokenized_example["input_ids"])
-        if old_len > self.max_seq_length:
-            for k in tokenized_example:
-                tokenized_example[k] = tokenized_example[k][
-                    : -(old_len - self.max_seq_length)
-                ]
-        return tokenized_example
-
-    def __iter__(self):
-        """
-        Iterates over the raw dataset and yields tokenized and truncated examples.
-        """
-        for example in self.raw_dataset:
-            tokenized_example = self.tokenize_example(example)
-            tokenized_example = self.truncate(tokenized_example)
-            yield tokenized_example
-
-    def __len__(self):
-        return len(self.raw_dataset)
-
-    def __getitem__(self, index):
-        """
-        Get a specific item by index. Note: Requires the raw_dataset to support indexing.
-        """
-        # Ensure the raw_dataset supports indexing
-        if not hasattr(self.raw_dataset, "__getitem__"):
-            raise TypeError("raw_dataset must support indexing to use __getitem__.")
-
-        example = self.raw_dataset[index]
-        tokenized_example = self.tokenize_example(example)
-        tokenized_example = self.truncate(tokenized_example)
-        return tokenized_example
-
+setup_caches(model, tokenizer_ultrachat, DEVICE, MAX_SEQ_LENGTH, cache_kwargs)
 
 ultrachat_datadic = load_dataset(DATASET_PATH)
 train_dataset = PromptIterableDataset(
@@ -240,7 +260,6 @@ train_dataset = PromptIterableDataset(
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
 
 for name, param in model.named_parameters():
-    print(name)
     if "attention.kv_cache.models" in name:
         param.requires_grad = True
     else:

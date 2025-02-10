@@ -1,4 +1,5 @@
 import random
+from typing import Any, Dict, List, Optional, Union
 from abc import ABC, abstractmethod
 from string import ascii_uppercase
 from pathlib import Path
@@ -6,12 +7,14 @@ import logging
 
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 
 from metric import AutoMetric
 from tokenizer import get_tokenizer
 
-logging.basicConfig(level=logging.INFO)  # Set logging level
+logging.basicConfig(level=logging.INFO)
+
+EVAL_LENGTH = 100
 
 
 class EvaluationTask(ABC):
@@ -759,25 +762,49 @@ NOTE: You should only predict the next line in the current file. Do not produce 
 
 
 class UltraChatTask(EvaluationTask):
-    DEFAULT_PROMPT_TEMPLATE = """You are given a chat dialog. Your task is to generate a response based on the previous conversation.
+    """
+    UltraChatTask is an evaluation task for chat-based dialogue generation.
 
-====CHAT HISTORY====
-{chat_history}
+    This task takes a chat dialog as input and creates training examples for generating a response.
+    Each training example includes the conversation history up to an assistant response and uses that
+    response as the target label.
 
-====YOUR RESPONSE===="""
+    Attributes:
+        DEFAULT_PROMPT_TEMPLATE (str): The default prompt template with chat history and response markers.
+        RAW_PROMPT_TEMPLATE (str): A raw prompt template for cases where only the chat history is needed.
+        train_split (str): Dataset split used for training.
+        validation_split (str): Dataset split used for validation.
+        test_split (str): Dataset split used for testing.
+        metrics (Dict[str, Any]): Dictionary mapping metric names to their corresponding evaluation objects.
+    """
+
     RAW_PROMPT_TEMPLATE = """{chat_history}"""
     train_split: str = "train_gen"
     validation_split: str = "val_gen"  # not originally in HF dataset
     test_split: str = "test_gen"
-    # mandatory_cols = ["messages"]
 
     def __init__(
         self,
-        prompt_template=RAW_PROMPT_TEMPLATE,
-        max_tokens=512,
-        tokenizer=None,
-        **kwargs,
-    ):
+        prompt_template: str = RAW_PROMPT_TEMPLATE,
+        max_tokens: int = 512,
+        tokenizer: Optional[Any] = None,  # pylint: disable=W0621
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the UltraChatTask.
+
+        This sets up the task by specifying the prompt template, maximum tokens for generation,
+        tokenizer, and additional arguments. It also sets up the evaluation metrics using AutoMetric.
+
+        Args:
+            prompt_template (str, optional): The prompt template to use. Defaults to RAW_PROMPT_TEMPLATE.
+            max_tokens (int, optional): Maximum number of tokens for generation. Defaults to 512.
+            tokenizer (Optional[Any], optional): The tokenizer to use. Defaults to None.
+            **kwargs (Any): Additional keyword arguments. Expected to include at least:
+                - "hf_args": List of arguments for loading the Hugging Face dataset.
+                - "model_type": A string specifying the lightweight model type.
+                - "trained_weights": (Optional) Path to pretrained weights.
+        """
         super().__init__(
             prompt_template,
             max_tokens,
@@ -789,12 +816,27 @@ class UltraChatTask(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name("llm-rouge"),
-            "LLM-Judge": AutoMetric.from_name("llm-as-a-judge"),
+            "LLM-Rouge": AutoMetric.from_name(
+                "llm-rouge"
+            ),  # antropic AI very slow, optional
+            "LLM-Judge": AutoMetric.from_name(
+                "llm-as-a-judge"
+            ),  # antropic AI very slow, optional
         }
-        # self.requires_perplexity = True
 
-    def get_split(self, split):
+    def get_split(self, split: str) -> Union[Dataset, Any]:
+        """
+        Retrieve and preprocess the dataset split.
+
+        This method selects the appropriate split from the dataset, optionally performs a train-validation split,
+        applies the prepare_batch transformation, filters examples that are too long, and (if needed) samples a subset.
+
+        Args:
+            split (str): The dataset split to retrieve (e.g., "train_gen", "val_gen", "test_gen").
+
+        Returns:
+            Union[Dataset, Any]: The preprocessed dataset split.
+        """
         remove_cols = [
             col
             for col in self.dataset[split].column_names
@@ -807,10 +849,11 @@ class UltraChatTask(EvaluationTask):
             split_data = self.dataset[split_name]
             if split == "test_gen":
                 split_data = split_data.select(
-                    range(min(len(split_data), 100))
-                )  # Limit to 100 rows
+                    range(min(len(split_data), EVAL_LENGTH))
+                )  # Limit to EVAL_LENGTH rows for now in evaluation
 
             elif split != "test_gen":  # Train-validation split logic
+                # TODO: Implement a proper train-validation split with seed and parameter setting
                 total_size = len(split_data)
 
                 train_size = int(0.7 * total_size)
@@ -831,14 +874,14 @@ class UltraChatTask(EvaluationTask):
                 lambda x: len(self.tokenizer(x["prompt"])) + self.max_tokens
                 <= self.model_max_length
             )
-            logging.info(
+            print(
                 f"Filtered {len(split_data) - len(filtered_data)} examples from split {split}"
             )
 
             if self.num_samples > 0 and len(filtered_data) > self.num_samples:
                 n = min(self.num_samples, len(filtered_data))
-                logging.info(f"Randomly sample {n} examples")
-                # Use a fixed seed for reproducibility
+                print(f"Randomly sample {n} examples")
+                # Use a fixed seed for reproducibility, set in eval.py 375
                 inds = random.Random(n).sample(range(len(filtered_data)), n)
                 filtered_data = filtered_data.select(inds)
 
@@ -847,50 +890,37 @@ class UltraChatTask(EvaluationTask):
 
         return self.dataset[split]
 
-    # def prepare_row(self, row):
-    #     """
-    #     Processes a single chat row using only the first user message as the prompt
-    #     and the first assistant response as the label.
-    #     """
-    #     messages = row["messages"]  # Extract chat messages
-
-    #     if len(messages) < 2:
-    #         raise ValueError(
-    #             "Each row must contain at least one user and one assistant message."
-    #         )
-
-    #     assistant_response = messages[1]
-
-    #     # Ensure correct roles
-    #     if assistant_response["role"] != "assistant":
-    #         raise ValueError(
-    #             "Expected first message to be from user and second from assistant."
-    #         )
-    #     prompt = self.prompt_template.format(repo=row["prompt"])
-    #     return {
-    #         "prompt": prompt,
-    #         "context": prompt,  # Context is just the user input
-    #         "question": None,  # No explicit question in a chat dataset
-    #         "labels": assistant_response[
-    #             "content"
-    #         ],  # Assistant's first response is the label
-    #     }
-
-    def prepare_row(self, row):
+    def prepare_row(self, row: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
         """
         Processes a single chat row to create multiple training examples.
-        Each example includes the conversation history up to an assistant response.
+
+        Each training example corresponds to an assistant response within the conversation.
+        The prompt is constructed using all previous messages (i.e. the conversation history up to,
+        but not including, the current assistant response), which is used both as the prompt and context.
+        The assistant's response is then used as the label.
+
+        Args:
+            row (Dict[str, Any]): A dictionary representing a chat conversation. It must contain the key
+                "messages", where the value is a list of message dictionaries. Each message dictionary
+                should have at least the keys "role" and "content", where "role" is a string indicating
+                the speaker (e.g., "user" or "assistant") and "content" is the text content.
+
+        Returns:
+            List[Dict[str, Optional[str]]]: A list of training example dictionaries. Each dictionary contains:
+                - "prompt": A string containing the conversation history (excluding the current assistant response).
+                - "context": The same string as the prompt.
+                - "question": Always None, as there is no explicit question.
+                - "labels": The assistant's response text corresponding to that point in the conversation.
         """
-        messages = row["messages"]  # Extract chat messages
-        chat_history = []  # Store formatted chat history
-        processed_examples = []  # Store multiple training examples
+        messages = row["messages"]
+        chat_history = []
+        processed_examples = []
 
         for message in messages:
             role = message["role"]
             content = message["content"]
             chat_history.append(f"{role.capitalize()}: {content}")
 
-            # Every time we reach an assistant response, create a new training example
             if role == "assistant":
                 prompt = self.prompt_template.format(
                     chat_history="\n".join(chat_history[:-1])
@@ -899,13 +929,13 @@ class UltraChatTask(EvaluationTask):
                 processed_examples.append(
                     {
                         "prompt": prompt,
-                        "context": prompt,  # Context includes previous messages
-                        "question": None,  # No explicit question
-                        "labels": content,  # Assistant's response as the label
+                        "context": prompt,
+                        "question": None,
+                        "labels": content,
                     }
                 )
 
-        return processed_examples  # Returns a list of training examples
+        return processed_examples
 
 
 TASK_MAPPING = {

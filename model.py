@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Optional, Dict, Any
-import pdb
+from typing import Optional, Dict, Any, List
 
 import math
 import torch
@@ -281,7 +280,18 @@ class Transformer(nn.Module):
     def min_cache_length(self):
         return min([layer.attention.kv_cache.max_cache_length for layer in self.layers])
 
-    def get_lightweight_params(self):
+    def get_lightweight_params(self) -> List[nn.Parameter]:
+        """
+        Retrieve parameters from all lightweight modules in the KV cache "lightweight".
+
+        This method iterates over each layer in the `kv_cache_lightweight_modules` dictionary
+        and aggregates the parameters from all the lightweight models associated with each layer.
+        These parameters can be used, for example, to set up an optimizer for fine-tuning only the
+        lightweight components of the cache.
+
+        Returns:
+            List[nn.Parameter]: A list containing all parameters from the lightweight modules.
+        """
         params = []
         for layer_idx, models in self.kv_cache_lightweight_modules.items():
             params.extend(models.parameters())
@@ -473,10 +483,9 @@ class Attention(nn.Module):
             and isinstance(self.kv_cache, KVCacheLightweight)
         ):
             # Compute scores using KVCacheLightweight
-            scores = self.kv_cache._token_importances(
+            scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos[-1]
             )  # try normalizing the scores
-            # pdb.set_trace()
             # Scale keys and values using the scores
             scaling_factors = torch.sigmoid(scores).unsqueeze(
                 -1
@@ -498,7 +507,6 @@ class Attention(nn.Module):
                 attn_mask=kv_mask if mask is None else mask,
                 dropout_p=0.0,
                 attn_top_k=attn_top_k,
-                # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
                 return_attn=self.kv_cache.return_attn(),
             )
 
