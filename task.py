@@ -816,12 +816,12 @@ class UltraChatTask(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge": AutoMetric.from_name(
-                "llm-rouge"
-            ),  # antropic AI very slow, optional
-            "LLM-Judge": AutoMetric.from_name(
-                "llm-as-a-judge"
-            ),  # antropic AI very slow, optional
+            # "LLM-Rouge": AutoMetric.from_name(
+            #     "llm-rouge"
+            # ),  # antropic AI very slow, optional
+            # "LLM-Judge": AutoMetric.from_name(
+            #     "llm-as-a-judge"
+            # ),  # antropic AI very slow, optional
         }
 
     def get_split(self, split: str) -> Union[Dataset, Any]:

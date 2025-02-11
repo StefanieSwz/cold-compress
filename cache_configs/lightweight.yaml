@@ -1,5 +1,5 @@
 cache_strategy: ["lightweight"]
-prompt_compression_strategy: ["l2"] # keep
+prompt_compression_strategy: ["heavy_hitter"] # keep
 cache_length_pattern: "tile"  # More compression at lower layers, TODO: use with differnt length patterns
 global_tokens: 4 # keep
 recent_window: 10 # keep
