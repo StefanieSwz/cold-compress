@@ -235,8 +235,15 @@ class Transformer(nn.Module):
                     b.attention.kv_cache.models
                 )
 
+            # Check if the prompt compressor strategy is lightweight
+            prompt_comp_strategy = kwargs["prompt_compression_strategy"][layer_idx]
+            if prompt_comp_strategy == "lightweight":
+                # Add n_local_heads info to the layer_kwargs for the prompt compressor
+                layer_kwargs["n_heads"] = self.config.n_local_heads
+                layer_kwargs["dtype"] = dtype
+
             b.attention.prompt_compressor = get_prompt_compressor_constructor(
-                kwargs["prompt_compression_strategy"][layer_idx]
+                prompt_comp_strategy
             )(head_specific=b.attention.kv_cache.head_specific, **layer_kwargs)
 
         self.freqs_cis = precompute_freqs_cis(
@@ -308,6 +315,7 @@ class Transformer(nn.Module):
         assert self.freqs_cis is not None, "Caches must be initialized first"
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+        # TODO: convolution over embedding only once here, so to speak first layer only method
 
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -419,12 +427,11 @@ class Attention(nn.Module):
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
-        v = v.transpose(
-            1, 2
-        )  # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode, (batch_size, n_local_heads, 1, head_dim) in decoding mode
+        v = v.transpose(1, 2)
+        # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode, (batch_size, n_local_heads, 1, head_dim) in decoding mode
 
         kv_mask = None
-        cache_kwargs = {"input_ids": input_ids}
+        cache_kwargs = {"input_ids": input_ids, "x": x, "query": q}
         if not is_prefill:
             k, v, kv_mask = self.kv_cache.update_kv(
                 input_pos, k, v, is_prefill, **cache_kwargs
@@ -436,19 +443,7 @@ class Attention(nn.Module):
         k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        if self.train_mode:
-            with torch.no_grad():
-                _, attn = scaled_dot_product_attention(
-                    q,
-                    k_rep,
-                    v_rep,
-                    attn_mask=kv_mask if mask is None else mask,
-                    dropout_p=0.0,
-                    attn_top_k=attn_top_k,
-                    # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
-                    return_attn=self.kv_cache.return_attn(),
-                )
-        else:
+        with torch.no_grad():
             y, attn = scaled_dot_product_attention(
                 q,
                 k_rep,

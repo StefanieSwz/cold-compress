@@ -22,4 +22,5 @@ scikit-learn
 sentencepiece
 tiktoken
 python-dotenv
+wandb
 git+https://github.com/google-research/bleurt.git

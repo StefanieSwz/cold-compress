@@ -72,13 +72,13 @@ class EvaluationTask(ABC):
                 lambda x: len(self.tokenizer(x["prompt"])) + self.max_tokens
                 <= self.model_max_length
             )
-            logging.info(
+            print(
                 f"Filtered {len(split_data) - len(filtered_data)} examples from split {split}"
             )
 
             if self.num_samples > 0 and len(filtered_data) > self.num_samples:
                 n = min(self.num_samples, len(filtered_data))
-                logging.info(f"Randomly sample {n} examples")
+                print(f"Randomly sample {n} examples")
                 # Use a fixed seed for reproducibility
                 inds = random.Random(n).sample(range(len(filtered_data)), n)
                 filtered_data = filtered_data.select(inds)
@@ -1017,7 +1017,7 @@ if __name__ == "__main__":
     if args.compute_stats:
         stats = []
         for task_name in TASK_MAPPING.keys():
-            logging.info(f"Computing stats for {task_name}")
+            print(f"Computing stats for {task_name}")
             task = AutoTask.from_name(task_name, **task_kwargs)
             test = task.get_test()
 
@@ -1060,25 +1060,25 @@ if __name__ == "__main__":
     else:
         task = AutoTask.from_name(args.task, **task_kwargs)
         test = task.get_test()
-        logging.info("Example test datapoint:\n\n")
+        print("Example test datapoint:\n\n")
         ex = test[0]
         for k, v in ex.items():
-            logging.info(f"{k}:\n{v}\n\n")
+            print(f"{k}:\n{v}\n\n")
 
         train_predictions = ["This is a train prediction"] * len(task.dataset["train"])
         test_predictions = ["This is a test prediction"] * len(test)
 
-        logging.info("A 'not ready' error should be displayed below:\n\n")
+        print("A 'not ready' error should be displayed below:\n\n")
         try:
             task.train_metrics(predictions=train_predictions)
         except Exception as e:
-            logging.info(e)
+            print(e)
 
-        logging.info("A 'length mismatch' error should be displayed below:\n\n")
+        print("A 'length mismatch' error should be displayed below:\n\n")
         try:
             task.test_metrics(predictions=test_predictions[:-1])
         except Exception as e:
-            logging.info(e)
+            print(e)
 
-        logging.info("Dummy metrics for test split:\n\n")
-        logging.info(task.test_metrics(predictions=test_predictions))
+        print("Dummy metrics for test split:\n\n")
+        print(task.test_metrics(predictions=test_predictions))

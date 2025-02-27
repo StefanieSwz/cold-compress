@@ -315,9 +315,9 @@ def apply_pyramid_pattern(
 
     if decreasing:
         cache_lens = cache_lens[::-1]
-        assert cache_lens[-1] < cache_lens[0], "Cache lengths should be decreasing."
+        assert cache_lens[-1] <= cache_lens[0], "Cache lengths should be decreasing."
     else:
-        assert cache_lens[0] < cache_lens[-1], "Cache lengths should be increasing."
+        assert cache_lens[0] <= cache_lens[-1], "Cache lengths should be increasing."
 
     return cache_lens
 
@@ -376,7 +376,10 @@ def setup_caches(
         cache_kwargs["max_cache_length"]
     ), "Global tokens must be less than max_cache_length."
 
-    if cache_kwargs["cache_strategy"][0] == "hybrid":
+    if (
+        cache_kwargs["cache_strategy"][0] == "hybrid"
+        or cache_kwargs["cache_strategy"][0] == "lightweight"
+    ):
         # We need to pass the special and punctuation token ids to the cache via cache_kwargs
         cache_kwargs["token_ids"] = {
             "special": tokenizer.special_ids(),
@@ -386,9 +389,13 @@ def setup_caches(
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)
         if cache_kwargs["cache_strategy"][0] == "lightweight":
-            file = Path(cache_kwargs.pop("trained_weights"))
+            file = Path(cache_kwargs["trained_weights"])
             if file.exists() and file.is_file():
-                load_trained_lightweight(model, file)
+                load_trained_lightweight(model, file, load_kv=True)
+        if cache_kwargs["prompt_compression_strategy"][0] == "lightweight":
+            file = Path(cache_kwargs["trained_weights"])
+            if file.exists() and file.is_file():
+                load_trained_lightweight(model, file, load_kv=False)
     return cache_kwargs
 
 

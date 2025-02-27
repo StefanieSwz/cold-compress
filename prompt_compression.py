@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import pdb
 from abc import ABC, abstractmethod
 
 
@@ -9,7 +11,9 @@ class PromptCompressor(ABC):
             setattr(self, key, value)
 
         self.head_specific = head_specific
-        assert self.is_compatible(), f"Prompt compressor ({self.__class__.__name__}) is not compatible with the chosen cache strategy."
+        assert (
+            self.is_compatible()
+        ), f"Prompt compressor ({self.__class__.__name__}) is not compatible with the chosen cache strategy."
 
     def _recent_global_mask(self, input_pos):
         seq_len = input_pos.shape[-1]
@@ -145,6 +149,101 @@ class PromptCompressorRecentGlobal(PromptCompressorHeadConstant):
         )
 
 
+class PromptCompressorLightweight(PromptCompressorHeadSpecific):
+    """
+    Use SnapKV to compress the prompt
+    Based on the pseudo code on Page 7 of https://arxiv.org/abs/2404.14469
+    """
+
+    def __init__(self, head_specific, **kwargs) -> None:
+        super().__init__(head_specific, **kwargs)
+
+        # Initialize lightweight models for computing token scores.
+        if kwargs["model_type"] == "linear":
+            self.models = nn.ModuleList(
+                [nn.Linear(3, 1).to(kwargs["dtype"]) for _ in range(kwargs["n_heads"])]
+            )
+        elif kwargs["model_type"] == "mlp":
+            self.models = nn.ModuleList(
+                [
+                    nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1)).to(
+                        kwargs["dtype"]
+                    )
+                    for _ in range(kwargs["n_heads"])
+                ]
+            )
+        else:
+            raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
+
+        # Initialize the models' parameters with random weights.
+        # Trained weights are loaded from model perspective
+        with torch.no_grad():
+            for model in self.models:
+                for name, param in model.named_parameters():
+                    if "weight" in name:
+                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
+                    elif "bias" in name:
+                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
+
+    def _token_importances(self, input_pos, k_val, v_val, **kwargs):
+        """
+        Compute token importance scores using lightweight models.
+
+        This function extracts features from the entire cache (key norms, value norms,
+        and attention scores) and computes an importance score for each token using a
+        lightweight model (either linear or MLP) per attention head. The resulting scores
+        indicate which tokens in the cache are most important and have shape
+        [batch_size, n_heads, max_cache_length].
+
+        Args:
+            input_pos (torch.Tensor): The input positions in the sequence.
+
+        Returns:
+            torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
+        """
+        seq_len = input_pos.shape[-1]
+        attn = kwargs["attn"]
+        attn_scores = attn.mean(dim=2)
+        key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
+        value_norm = torch.linalg.vector_norm(v_val, ord=2, dim=-1)
+
+        # Extract features from the entire cache
+        features = torch.stack(
+            [
+                key_norm,  # [batch_size, n_heads, seq_len]
+                value_norm,  # [batch_size, n_heads, seq_len]
+                attn_scores,  # [batch_size, n_heads, seq_len]
+            ],
+            dim=-1,  # Resulting shape: [batch_size, n_heads, seq_len, 3]
+        )
+
+        # Initialize scores with -infinity for all cache slots
+        priority = torch.full(
+            (features.shape[0], features.shape[1], seq_len),
+            float("-inf"),
+            dtype=features.dtype,
+            device=features.device,
+        )
+
+        # Compute scores for the current valid positions using the lightweight models
+        for head_idx, model in enumerate(self.models):
+            # Compute scores for valid positions and update the scores tensor
+            priority[:, head_idx, :] = model(features[:, head_idx, :]).squeeze(-1)
+
+        # Give high score to global and recent tokens
+        save_mask = self._recent_global_mask(input_pos).view(1, 1, -1)
+        priority = priority.masked_fill(save_mask, float("inf"))
+
+        return priority
+
+    def _update_state(self, keep_idxs, input_pos, **kwargs):
+        seq_len = input_pos.shape[-1]
+        # Return average attention across prompt to insert into KV Cache's attention history tracker
+        cum_attn = kwargs["attn"].sum(dim=2) / (seq_len - input_pos)
+        cum_attn = cum_attn.gather(2, keep_idxs.view(1, -1, self.max_cache_length))
+        return cum_attn
+
+
 class PromptCompressorHeavyHitter(PromptCompressorHeadSpecific):
     """
     Use SnapKV to compress the prompt
@@ -243,5 +342,7 @@ def get_prompt_compressor_constructor(strategy):
         return PromptCompressorRandom
     elif strategy == "keep_it_odd":
         return PromptCompressorKeepItOdd
+    elif strategy == "lightweight":
+        return PromptCompressorLightweight
     else:
         raise ValueError(f"Unknown prompt compression strategy: {strategy}")

@@ -1,9 +1,13 @@
 import os
 import sys
 import time
+import argparse
 import signal
-from typing import Any, Dict, List, Optional, Iterator, Union
+from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
+import numpy as np
+from dotenv import load_dotenv
+import wandb
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -23,29 +27,19 @@ from generation_utils import (
     setup_caches,
 )
 
-
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
 # support running without installing as a package
-wd = Path(__file__).parent.parent.resolve()
-sys.path.append(str(wd))
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+sys.path.append(str(PROJECT_ROOT))
+
+load_dotenv()
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 signal.signal(signal.SIGINT, handle_sigint)
 sys.excepthook = handle_uncaught_exception
-
-# Configuration
-# TODO: Support terminal arguments via argparse
-CHECKPOINT_PATH = Path("./checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth")
-TOKENIZER_PATH = Path(CHECKPOINT_PATH).parent / "tokenizer.model"
-DATASET_PATH = "HuggingFaceH4/ultrachat_200k"
-BATCH_SIZE = 1
-EPOCHS = 5
-LEARNING_RATE = 3e-6
-MAX_SEQ_LENGTH = 2048
-IGNORE_INDEX = -100
 
 
 class PromptIterableDataset(IterableDataset):
@@ -65,6 +59,7 @@ class PromptIterableDataset(IterableDataset):
         raw_dataset: Dataset,
         tokenizer: TokenizersChatFormat,
         max_seq_length: Optional[int] = 512,
+        ignore_index: int = -100,
     ):
         """
         Initialize the PromptIterableDataset.
@@ -87,6 +82,7 @@ class PromptIterableDataset(IterableDataset):
         self.raw_dataset = raw_dataset
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
+        self.ignore_index = ignore_index
 
     def tokenize_example(self, example: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -115,7 +111,7 @@ class PromptIterableDataset(IterableDataset):
             if message["role"] == "user":
                 labels[
                     current_token_position : current_token_position + message_length
-                ] = IGNORE_INDEX
+                ] = self.ignore_index
 
             current_token_position += message_length
 
@@ -193,132 +189,394 @@ class PromptIterableDataset(IterableDataset):
         return tokenized_example
 
 
-assert CHECKPOINT_PATH.is_file(), CHECKPOINT_PATH
-if not TOKENIZER_PATH.is_file():
-    # If there's no tokenizer.model, try to load the tokenizer from the parent directory
-    # NOTE: We assume the tokenizer in the parent directory is compatible with huggingface transformers
-    TOKENIZER_PATH = CHECKPOINT_PATH.parent
+def add_train_arguments(parser: argparse.ArgumentParser):
+    # Generation hparams
+    parser.add_argument(
+        "--checkpoint_path",
+        type=Path,
+        default=Path(__file__).resolve().parent
+        / "checkpoints/Qwen/Qwen2-0.5B-Instruct/model.pth",
+        help="Model checkpoint path.",
+    )
+
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "linear"],
+        help="Model type for training.",
+    )
+
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="HuggingFaceH4/ultrachat_200k",
+        help="Dataset path.",
+    )
+
+    parser.add_argument(
+        "--train_ratio",
+        type=int,
+        default=0.7,
+        help="Train ratio for training.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for random number generators.",
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        choices=[1],
+        help="Batch size for training. Currently only supports batch size of 1.",
+    )
+
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=5,
+        help="Number of gradient accumulation steps.",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Number of training epochs.",
+    )
+
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=3e-6,
+        help="Learning rate for training.",
+    )
+
+    parser.add_argument(
+        "--max_seq_length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length for training.",
+    )
+
+    parser.add_argument(
+        "--ignore_index",
+        type=int,
+        default=-100,
+        help="Ignore index for loss computation.",
+    )
+
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=1000,
+        help="Number of examples to sample for evaluation. Defaults to -1, which uses the full dataset.",
+    )
+
+    parser.add_argument(
+        "--cache_length_pattern",
+        type=str,
+        default="pyramid",
+        help="Cache length pattern.",
+    )
+
+    parser.add_argument(
+        "--global_tokens",
+        type=int,
+        default=4,
+        help="Number of global tokens.",
+    )
+
+    parser.add_argument(
+        "--recent_window",
+        type=int,
+        default=10,
+        help="Recent window size.",
+    )
 
 
-# Load model
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-rank = maybe_init_dist()
-print("Rank: ", rank)
-use_tp = rank is not None
-if use_tp:
-    if rank != 0:
-        # only print on rank 0
-        print = lambda *args, **kwargs: None
+def prepare_dataset(
+    tokenizer: nn.Module, args: argparse.Namespace
+) -> Tuple[DataLoader, DataLoader]:
+    # Load dataset
+    ultrachat_datadic = load_dataset(args.dataset_path)
+    len_ultrachat = len(ultrachat_datadic["train_gen"])  # full set
 
-print(f"Using device={DEVICE}")
-PRECISION = torch.bfloat16
-IS_CHAT = (
-    "chat" in str(CHECKPOINT_PATH).lower() or "instruct" in str(CHECKPOINT_PATH).lower()
-)
+    # If num_samples is -1, use the full set; otherwise, use the specified number
+    if args.num_samples == -1:
+        args.num_samples = len_ultrachat
 
-print("Loading model ...")
-t0 = time.time()
-model = load_model(CHECKPOINT_PATH, DEVICE, PRECISION, use_tp)
-device_sync(device=DEVICE)  # MKG
-print(f"Time to load model: {time.time() - t0:.02f} seconds")
+    indices = np.arange(len_ultrachat)
+    np.random.seed(args.seed)
+    np.random.shuffle(indices)
+    selected_indices = indices[: args.num_samples]
 
-# Load tokenizer
-tokenizer_ultrachat = get_tokenizer(TOKENIZER_PATH, CHECKPOINT_PATH, is_chat=IS_CHAT)
+    split_point = int(args.train_ratio * args.num_samples)
+    train_indices = selected_indices[:split_point]
+    val_indices = selected_indices[split_point:]
 
-cache_kwargs = {
-    "max_new_tokens": 512,
-    "cache_config": None,
-    "checkpoint_path": CHECKPOINT_PATH,
-    "profile": None,
-    "compile": False,
-    "device": "cuda",
-    "attn_top_k": 1.0,
-    "max_cache_length": [1.0],
-    "cache_bits": None,
-    "cache_length_pattern": "tile",
-    "cache_strategy": ["lightweight"],
-    "cache_strategy_pattern": "tile",
-    "feed_long_prompts": False,
-    "prompt_compression_strategy": ["l2"],
-    "global_tokens": 1,
-    "recent_window": 10,
-    "history_window_size": 1,
-    "attn_thresholding": False,
-    "model_type": "mlp",
-    "trained_weights": "none",
-    "min_recovery_frac": 0.9,
-}
+    train_samples = ultrachat_datadic["train_gen"].select(train_indices.tolist())
+    val_samples = ultrachat_datadic["train_gen"].select(val_indices.tolist())
 
-setup_caches(model, tokenizer_ultrachat, DEVICE, MAX_SEQ_LENGTH, cache_kwargs)
+    train_dataset = PromptIterableDataset(train_samples, tokenizer, args.max_seq_length)
+    val_dataset = PromptIterableDataset(val_samples, tokenizer, args.max_seq_length)
 
-ultrachat_datadic = load_dataset(DATASET_PATH)
-train_dataset = PromptIterableDataset(
-    ultrachat_datadic["train_gen"].select(range(1000)),
-    tokenizer_ultrachat,
-    MAX_SEQ_LENGTH,
-)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
-for name, param in model.named_parameters():
-    if "attention.kv_cache.models" in name:
-        param.requires_grad = True
-    else:
-        param.requires_grad = False
+    return train_loader, val_loader
 
-# Optimizer
-optimizer = AdamW(model.get_lightweight_params(), lr=LEARNING_RATE)
-loss = nn.CrossEntropyLoss()
 
-# Training Loop
-# Generate a timestamp for the save file
-timestamp = time.strftime("%Y%m%d_%H%M%S")
-print("Starting training...")
-model.train()
-model.set_train_mode(True)
-for epoch in range(EPOCHS):
-    total_loss = 0
-    for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}"):
-        batch = {
-            key: value.to(DEVICE) if torch.is_tensor(value) else value
-            for key, value in batch.items()
-        }
-        input_ids = batch["input_ids"]
-        labels = batch["labels"]
-        labels = labels[:, 1:]  # Remove the first token
-        labels = labels.reshape(-1)
+def main(args: argparse.Namespace) -> None:
+    checkpoint_path = args.checkpoint_path
 
-        # Input positions and prefill flags
-        prompt_length = input_ids.size(1)
-        input_pos = torch.arange(0, prompt_length, device=DEVICE)
+    # Init wandb
+    wandb_api_key = os.getenv("WANDB_API_KEY")
+    wandb_project = os.getenv("WANDB_PROJECT")
+    wandb_entity = os.getenv("WANDB_ENTITY")
+    wandb_account = os.getenv("WANDB_ACCOUNT")
+    wandb_model_registry = os.getenv("WANDB_MODEL_REGISTRY")
 
-        causal_mask = (
-            torch.tril(torch.ones(len(input_pos), len(input_pos), dtype=torch.bool))
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .to(input_ids.device)
-        )
-        # Forward pass
+    # Validate that all required environment variables are present
+    if not wandb_api_key:
+        raise ValueError("WANDB_API_KEY environment variable is not set.")
+    if not wandb_project:
+        raise ValueError("WANDB_PROJECT environment variable is not set.")
+    if not wandb_entity:
+        raise ValueError("WANDB_ENTITY environment variable is not set.")
+    if not wandb_account:
+        raise ValueError("WANDB_ACCOUNT environment variable is not set.")
+    if not wandb_model_registry:
+        raise ValueError("WANDB_MODEL_REGISTRY environment variable is not set.")
+
+    wandb.login(key=wandb_api_key)
+    run = wandb.init(
+        project=wandb_project,
+        entity=wandb_entity,
+        config=vars(args),
+    )
+    registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
+
+    # Configuration
+    assert checkpoint_path.is_file(), checkpoint_path
+    tokenizer_path = Path(checkpoint_path).parent / "tokenizer.model"
+    if not tokenizer_path.is_file():
+        # If there's no tokenizer.model, try to load the tokenizer from the parent directory
+        # NOTE: We assume the tokenizer in the parent directory is compatible with huggingface transformers
+        tokenizer_path = checkpoint_path.parent
+
+    precision = torch.bfloat16
+    is_chat = (
+        "chat" in str(checkpoint_path).lower()
+        or "instruct" in str(checkpoint_path).lower()
+    )
+
+    # Load model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device={device}")
+    # distributed training
+    rank = maybe_init_dist()
+    use_tp = rank is not None
+    # if use_tp:
+    #     if rank != 0:
+    #         # only print on rank 0
+    #         print = lambda *args, **kwargs: None
+
+    print("Loading model ...")
+    t0 = time.time()
+    model = load_model(checkpoint_path, device, precision, use_tp)
+    device_sync(device=device)  # MKG
+    print(f"Time to load model: {time.time() - t0:.02f} seconds")
+
+    # Load tokenizer
+    tokenizer = get_tokenizer(tokenizer_path, checkpoint_path, is_chat=is_chat)
+
+    cache_kwargs = {
+        "checkpoint_path": checkpoint_path,
+        "compile": False,
+        "device": device,
+        "max_cache_length": [1.0],
+        "cache_bits": None,  # dont quantice cache
+        "cache_length_pattern": args.cache_length_pattern,
+        "cache_strategy": ["lightweight"],
+        "cache_strategy_pattern": "repeat",
+        "feed_long_prompts": False,  # rather truncate incoming prompts
+        "prompt_compression_strategy": [
+            "full"
+        ],  # we are not compressing during training
+        "global_tokens": args.global_tokens,
+        "recent_window": args.recent_window,
+        "model_type": args.model_type,
+        "trained_weights": "none",  # train new weights
+    }
+    wandb.config.update(cache_kwargs)
+
+    setup_caches(model, tokenizer, device, args.max_seq_length, cache_kwargs)
+
+    train_loader, val_loader = prepare_dataset(tokenizer, args)
+
+    for name, param in model.named_parameters():
+        if "attention.kv_cache.models" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    # Optimizer
+    optimizer = AdamW(model.get_lightweight_params(), lr=args.learning_rate)
+    loss = nn.CrossEntropyLoss(
+        ignore_index=args.ignore_index, reduction="mean"
+    )  # reduction is set to 'mean', thus the loss is automatically normalized by the number of tokens that are not ignored.
+
+    # Training Loop
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    print("Starting training...")
+    model.train()
+    model.set_train_mode(True)
+
+    for epoch in range(args.epochs):
+        total_loss = 0
         optimizer.zero_grad()
-        torch.autograd.set_detect_anomaly(True)
-        logits = model(
-            input_ids, input_pos, mask=causal_mask, is_prefill=True
-        )  # prefill = true for training on full sequence
+        for i, batch in enumerate(
+            tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
+        ):
+            # Move batch data to device
+            batch = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in batch.items()
+            }
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            labels = labels[:, 1:]  # Remove the first token
+            labels = labels.reshape(-1)
 
-        # Loss computation
-        logits = logits[:, :-1].reshape(-1, logits.size(-1))
-        labels = labels.reshape(-1)
-        loss_epoch = loss(logits, labels)
+            # Input positions and prefill flags
+            prompt_length = input_ids.size(1)
+            input_pos = torch.arange(0, prompt_length, device=device)
 
-        # Backward pass
-        loss_epoch.backward()
+            causal_mask = (
+                torch.tril(torch.ones(len(input_pos), len(input_pos), dtype=torch.bool))
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(input_ids.device)
+            )
 
-        optimizer.step()
+            # Forward pass
+            # torch.autograd.set_detect_anomaly(True)
+            logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
 
-        total_loss += loss_epoch.item()
+            # Reshape logits and labels for loss computation
+            logits = logits[:, :-1].reshape(-1, logits.size(-1))
+            labels = labels.reshape(-1)
+            loss_epoch = loss(logits, labels)
 
-    avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch + 1}/{EPOCHS} completed. Average Loss: {avg_loss:.4f}")
-    save_path = save_lightweight(
-        model, cache_kwargs, timestamp
-    )  # override weights each epoch
-    print(f"Model saved to {save_path}")
+            # Normalize loss for gradient accumulation
+            loss_epoch = loss_epoch / args.gradient_accumulation_steps
+            loss_epoch.backward()
+            total_loss += loss_epoch.item() * args.gradient_accumulation_steps
+
+            # Update parameters every accumulation_steps mini-batches or at end of epoch
+            if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(
+                train_loader
+            ):
+                optimizer.step()
+                optimizer.zero_grad()
+                wandb.log(
+                    {
+                        "train_batch_loss": loss_epoch.item()
+                        * args.gradient_accumulation_steps
+                    }
+                )
+
+        avg_train_loss = total_loss / len(train_loader)
+        print(
+            f"Epoch {epoch + 1}/{args.epochs} completed. Average Training Loss: {avg_train_loss:.4f}"
+        )
+        wandb.log({"epoch": epoch + 1, "train_loss": avg_train_loss})
+
+        # ---- Validation Loop ----
+        model.eval()  # Switch to evaluation mode for validation
+        # model.set_train_mode(False)
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}"):
+                # Move batch data to device
+                batch = {
+                    key: value.to(device) if torch.is_tensor(value) else value
+                    for key, value in batch.items()
+                }
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
+                labels = labels[:, 1:]  # Remove the first token
+                labels = labels.reshape(-1)
+
+                prompt_length = input_ids.size(1)
+                input_pos = torch.arange(0, prompt_length, device=device)
+                causal_mask = (
+                    torch.tril(
+                        torch.ones(len(input_pos), len(input_pos), dtype=torch.bool)
+                    )
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .to(input_ids.device)
+                )
+                logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
+                logits = logits[:, :-1].reshape(-1, logits.size(-1))
+                labels = labels.reshape(-1)
+                val_loss = loss(
+                    logits, labels
+                )  # validation loss computed based on the scaled tensors not the compressed sequence
+                total_val_loss += val_loss.item()
+                # wandb.log({"val_batch_loss": val_loss.item()})
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
+        wandb.log({"epoch": epoch + 1, "val_loss": avg_val_loss})
+
+        model.train()  # Switch back to training mode
+        # model.set_train_mode(True)
+        save_path = save_lightweight(
+            model, cache_kwargs, timestamp
+        )  # override weights each epoch
+        print(f"Model saved to {save_path}")
+
+        parent_model_name = Path(checkpoint_path).parent.name
+        final = False
+
+        if epoch == args.epochs - 1:
+            # Save the final model to the model registry
+            final = True
+
+        artifact = wandb.Artifact(
+            name="model.pth",
+            type="model",
+            metadata={
+                "epoch": epoch + 1,
+                "date": timestamp,
+                "validation_loss": avg_val_loss,
+                "model_type": args.model_type,
+                "parent_model": parent_model_name,
+                "final": final,
+            },
+        )
+        artifact.add_file(save_path)
+        run.link_artifact(
+            artifact=artifact,
+            target_path=registry_path,
+        )
+
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Training script for lightweight KV-Cache Compression Algorithms."
+    )
+
+    add_train_arguments(parser)
+
+    main(args=parser.parse_args())
