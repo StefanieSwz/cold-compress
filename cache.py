@@ -971,7 +971,9 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                     ) * self.conv_hidden_channels
                 else:
                     print("No convolution feature initialized")
-
+        elif "normalized_pos" in kwargs["feature_selection"]:
+            # no buffer needed as computed directly in token_importance
+            self.feature_space_dim += 1
         # Initialize lightweight models for computing token scores.
         if kwargs["model_type"] == "linear":
             self.models = nn.ModuleList(
@@ -1008,8 +1010,9 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         # Initialize the models' parameters with random weights.
         # Trained weights are loaded from model perspective
         with torch.no_grad():
-            for feat, conv_block in self.conv_layers.items():
-                conv_block.apply(init_weights)
+            if "convolution" in kwargs["feature_selection"]:
+                for feat, conv_block in self.conv_layers.items():
+                    conv_block.apply(init_weights)
             for model in self.models:
                 model.apply(init_weights)
 
@@ -1057,16 +1060,13 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         """
         return True
 
-    # TODO: test outstanding
-    def filter_embedding(
-        self, input_pos: torch.Tensor, x: torch.Tensor
-    ) -> torch.Tensor:
+    def filter_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Filters vectors from x using indices provided by input_pos.
+        Filters vectors from x using indices provided by self.pos.
+        self.pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
+                                    or -1 indicating an unfilled slot.
 
         Args:
-            input_pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
-                                    or -1 indicating an unfilled slot.
             x (torch.Tensor): Tensor of shape [B, T, D] containing token embeddings.
 
         Returns:
@@ -1074,7 +1074,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         index, the corresponding token embedding from x is gathered; otherwise, the slot is zeroed.
         """
         # Get dimensions.
-        B, H, M = input_pos.shape
+        B, H, M = self.pos.shape
         _, T, D = x.shape
 
         # Expand x to include a head dimension.
@@ -1082,10 +1082,10 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         x_exp = x.unsqueeze(1).expand(B, H, T, D)
 
         # Create a boolean mask for valid positions (positions not equal to -1).
-        valid_mask = input_pos != -1  # shape: [B, H, M]
+        valid_mask = self.pos != -1  # shape: [B, H, M]
 
         # Create safe indices to use with gather: replace -1 with 0.
-        safe_indices = input_pos.clone()
+        safe_indices = self.pos.clone()
         safe_indices[~valid_mask] = 0  # shape: [B, H, M]
 
         # Prepare safe_indices for torch.gather by unsqueezing and expanding to match x_exp's D dimension.
@@ -1101,14 +1101,13 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
         return filtered
 
-    # TODO: test outstanding
-    def filter_query(self, input_pos: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    def filter_query(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Filters vectors from x using indices provided by input_pos.
+        Filters vectors from x using indices provided by self.pos.
+                self.pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
+                                or -1 indicating an unfilled slot.
 
         Args:
-            input_pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
-                                    or -1 indicating an unfilled slot.
             x (torch.Tensor): Tensor of shape [B, H, T, D] containing token embeddings.
 
         Returns:
@@ -1116,14 +1115,14 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         index, the corresponding token embedding from x is gathered; otherwise, the slot is zeroed.
         """
         # Get dimensions.
-        B, H, M = input_pos.shape
+        B, H, M = self.pos.shape
         _, _, T, D = x.shape
 
         # Create a boolean mask for valid positions (positions not equal to -1).
-        valid_mask = input_pos != -1  # shape: [B, H, M]
+        valid_mask = self.pos != -1  # shape: [B, H, M]
 
         # Create safe indices to use with gather: replace -1 with 0.
-        safe_indices = input_pos.clone()
+        safe_indices = self.pos.clone()
         safe_indices[~valid_mask] = 0  # shape: [B, H, M]
 
         # Prepare safe_indices for torch.gather by unsqueezing and expanding to match x's D dimension.
@@ -1139,37 +1138,55 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
         return filtered
 
-    # TODO: test outstanding
-    def build_special_ids_mask(self, input_ids):
-        seq_len = input_ids.shape[-1]
-        special_ids_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    def build_ids_mask(self, input_ids, token_ids):
+        """
+        Builds a special token mask from input_ids and expands it using self.pos.
 
-        for special_id in self.special_ids:
-            # Iterate over input_ids to check for the exact sub-sequence
-            id_len = len(special_id)
+        Args:
+            input_ids (torch.Tensor): A tensor of shape [B, seq_len] containing token IDs.
+            token_ids (List(torch.Tensor)): A list of ids that are belonging to either special or punctuation tokens.
+
+        Returns:
+            torch.Tensor: A boolean mask of shape [B, n_heads, max_cache_len] where True indicates that
+                        the token at that cache position (as given by self.pos) is a special token.
+        """
+        B, seq_len = input_ids.shape
+        ids_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        for id in token_ids:
+            id_len = len(id)
             if id_len == 1:
-                special_ids_mask[torch.where(input_ids == special_id)[0]] = 1
+                # Extract the scalar value from the list
+                token = id[0]
+                # Compare input_ids with the scalar value
+                ids_mask[input_ids == token] = True
             else:
+                # For multi-token sequences, convert the list to a tensor
+                id_tensor = torch.tensor(
+                    id, dtype=input_ids.dtype, device=input_ids.device
+                )
                 for i in range(seq_len - id_len + 1):
-                    if torch.equal(input_ids[i : i + id_len], special_id):
-                        special_ids_mask[i : i + id_len] = 1
-        return special_ids_mask
+                    if torch.equal(input_ids[i : i + id_len], id_tensor):
+                        ids_mask[i : i + id_len] = True
+            valid_mask = self.pos != -1  # shape: [B, n_heads, max_cache_len]
 
-    # TODO: test outstanding
-    def build_punc_ids_mask(self, input_ids):
-        seq_len = input_ids.shape[-1]
-        punc_ids_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            # Replace -1 with 0 to safely index into the base mask.
+            safe_pos = self.pos.clone()
+            safe_pos[~valid_mask] = 0  # shape: [B, n_heads, max_cache_len]
 
-        for punc_id in self.punctuation_ids:
-            # Iterate over input_ids to check for the exact sub-sequence
-            id_len = len(punc_id)
-            if id_len == 1:
-                punc_ids_mask[torch.where(input_ids == punc_id)[0]] = 1
-            else:
-                for i in range(seq_len - id_len + 1):
-                    if torch.equal(input_ids[i : i + id_len], punc_id):
-                        punc_ids_mask[i : i + id_len] = 1
-        return punc_ids_mask
+            # Expand base_mask from [B, seq_len] to [B, n_heads, seq_len]
+            mask_exp = ids_mask.unsqueeze(1).expand(B, self.n_heads, seq_len)
+
+            # Use torch.gather to pick out the mask values at the positions specified by safe_pos.
+            # The gather is performed along dimension 2 (the sequence dimension).
+            expanded_mask = torch.gather(
+                mask_exp, dim=2, index=safe_pos
+            )  # shape: [B, n_heads, max_cache_len]
+
+            # Ensure that positions where self.pos was -1 remain False.
+            expanded_mask = expanded_mask & valid_mask
+
+            return expanded_mask
 
     def update_state(  # pylint: disable=W0221
         self,
@@ -1197,25 +1214,23 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         """
         x = kwargs["x"]  # x.shape = [batch_size, sequence_length, head_dim]
         q = kwargs["q"]  # q.shape = [batch_size, n_heads, sequence_length, head_dim]
-        x_filtered = self.filter_embedding(
-            self.pos, x
-        )  # shape = [batch_size, n_heads, max_cache_length, head_dim]
-        q_filtered = self.filter_query(
-            self.pos, q
-        )  # shape = [batch_size, n_heads, max_cache_length, head_dim]
-        batch_size, seq_len, head_dim = (
+        batch_size, seq_len, _ = (
             x.shape
         )  # seq_len is 1 for not prefill, and complete sequence length for prefill, that can be larger then max_cache_length
         if is_prefill:
+            x_filtered = self.filter_embedding(x)
+            # shape = [batch_size, n_heads, max_cache_length, head_dim]
+            q_filtered = self.filter_query(q)
+            # shape = [batch_size, n_heads, max_cache_length, head_dim]
             if "vector_norm" in self.feature_selection:
                 # Calculate norms over the head dimension.
                 # key and value already filtered by prompt compressor
                 key_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
                     k_val, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len]
+                )  # [batch_size, n_heads, max_cache_len/prompt_len]
                 value_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
                     v_val, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len]
+                )  # [batch_size, n_heads, max_cache_len/prompt_len]
                 query_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
                     q_filtered, ord=2, dim=-1
                 )  # [batch_size, n_heads, max_cache_len]
@@ -1265,14 +1280,33 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 attn = attn.view(
                     1, self.n_heads, -1
                 )  # [batch_size, n_heads, prompt_len]
+                # can handle both cases, already compressed version from prompt compressor or if prompt_len < cache-len
                 seq_len_actual = attn.shape[-1]
                 self.attn_score[:, :, :seq_len_actual] = attn.detach()
+            elif "token_profiling" in self.feature_selection:
+                # Token profiling features
+                # input_ids: shape (batch, seq_len)
+                token_special_profiling = torch.zeros(
+                    (batch_size, self.n_heads, seq_len), dtype=self.dtype
+                )
+                token_punctuation_profiling = torch.zeros(
+                    (batch_size, self.n_heads, seq_len), dtype=self.dtype
+                )
+                token_special_profiling = self.build_ids_mask(
+                    kwargs["input_ids"], self.special_ids
+                )
+                token_punctuation_profiling = self.build_ids_mask(
+                    kwargs["input_ids"], self.punctuation_ids
+                )
+                # shape (batch, n_heads, max_cache_len)
+                self.token_special_profiling = token_special_profiling.detach()
+                self.token_punctuation_profiling = token_punctuation_profiling.detach()
             elif "convolution" in self.feature_selection:
                 feature_dict = {
-                    "embedding": x_filtered,
-                    "query": q_filtered,
-                    "key": k_val,
-                    "value": v_val,
+                    "embedding": x_filtered.detach(),
+                    "query": q_filtered.detach(),
+                    "key": k_val.detach(),
+                    "value": v_val.detach(),
                 }
                 valid_mask = self.pos != -1  # shape: [B, H, M]
                 # Find indices of valid slots.
@@ -1307,18 +1341,6 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                     conv_buffer[
                         valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
                     ] = conv_out
-            elif "token_profiling" in self.feature_selection:
-                # Token profiling features
-                token_special_profiling = torch.zeros(
-                    (batch_size, self.n_heads, seq_len), dtype=self.dtype
-                )
-                token_punctuation_profiling = torch.zeros(
-                    (batch_size, self.n_heads, seq_len), dtype=self.dtype
-                )
-                token_special_profiling = self.build_special_ids_mask(input_pos)
-                token_punctuation_profiling = self.build_punc_ids_mask(input_pos)
-                self.token_special_profiling = token_special_profiling
-                self.token_punctuation_profiling = token_punctuation_profiling
 
         else:
             # Generation phase: update only the new token's key and value norms,
@@ -1470,31 +1492,49 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
         features_to_cat = []
         if "attn_score" in self.feature_selection:
-            features_to_cat.append(self.attn_score)
+            features_to_cat.append(self.attn_score.unsqueeze(-1))
         elif "vector_norm" in self.feature_selection:
             features_to_cat.extend(
-                [self.key_norm, self.value_norm, self.query_norm, self.embedding_norm]
+                [
+                    self.key_norm.unsqueeze(-1),
+                    self.value_norm.unsqueeze(-1),
+                    self.query_norm.unsqueeze(-1),
+                    self.embedding_norm.unsqueeze(-1),
+                ]
             )
         elif "vector_cv" in self.feature_selection:
             features_to_cat.extend(
-                [self.key_cv, self.value_cv, self.query_cv, self.embedding_cv]
+                [
+                    self.key_cv.unsqueeze(-1),
+                    self.value_cv.unsqueeze(-1),
+                    self.query_cv.unsqueeze(-1),
+                    self.embedding_cv.unsqueeze(-1),
+                ]
             )
         elif "vector_z_score" in self.feature_selection:
             features_to_cat.extend(
-                [self.key_z, self.value_z, self.query_z, self.embedding_z]
+                [
+                    self.key_z.unsqueeze(-1),
+                    self.value_z.unsqueeze(-1),
+                    self.query_z.unsqueeze(-1),
+                    self.embedding_z.unsqueeze(-1),
+                ]
             )
         elif "token_profiling" in self.feature_selection:
             features_to_cat.extend(
-                [self.token_special_profiling, self.token_punctuation_profiling]
+                [
+                    self.token_special_profiling.unsqueeze(-1),
+                    self.token_punctuation_profiling.unsqueeze(-1),
+                ]
             )
         elif "convolution" in self.feature_selection:
             for feat in self.convolution_features:
                 buffer_attr = f"{feat}_conv_values"
                 features_to_cat.append(getattr(self, buffer_attr))
         elif "normalized_pos" in self.feature_selection:
-            features_to_cat.append(normalized_pos)
+            features_to_cat.append(normalized_pos.unsqueeze(-1))
 
-        features = torch.stack(features_to_cat, dim=3)
+        features = torch.cat(features_to_cat, dim=-1)
 
         # # Extract features from the entire cache
         # features = torch.stack(
