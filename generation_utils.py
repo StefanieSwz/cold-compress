@@ -385,6 +385,9 @@ def setup_caches(
             "special": tokenizer.special_ids(),
             "punctuation": tokenizer.punctuation_ids(),
         }
+    if cache_kwargs["cache_strategy"][0] == "lightweight":
+        # We need to pass the special and punctuation token ids to the cache via cache_kwargs
+        cache_kwargs["model_config"] = model.config
 
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)

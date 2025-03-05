@@ -146,8 +146,8 @@ transformer_configs = {
     "Qwen2-0.5B-Instruct": dict(
         block_size=32768,
         n_layer=24,
-        n_head=14,
-        n_local_heads=2,
+        n_head=14,  # query
+        n_local_heads=2,  # key and value
         dim=896,
         intermediate_size=4864,
         vocab_size=151936,
@@ -480,7 +480,7 @@ class Attention(nn.Module):
         ):
             # Compute scores using KVCacheLightweight
             scores = self.kv_cache._token_importances(  # pylint: disable=W0212
-                input_pos[-1]
+                input_pos
             )  # try normalizing the scores
             # Scale keys and values using the scores
             scaling_factors = torch.sigmoid(scores).unsqueeze(

@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import signal
+import pdb
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
 import numpy as np
@@ -205,6 +206,40 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         default="mlp",
         choices=["mlp", "linear"],
         help="Model type for training.",
+    )
+
+    parser.add_argument(
+        "--vector_convolution",
+        type=str,
+        default="double_conv",
+        choices=["double_conv", "single_conv", "none"],
+        help="Method for compressing vectors via convolutional layer.",
+    )
+
+    parser.add_argument(
+        "--convolution_features",
+        type=str,
+        nargs="+",
+        default=["embedding"],
+        choices=["key", "value", "query", "embedding"],
+        help="Which features to compress using the convolutional layer.",
+    )
+
+    parser.add_argument(
+        "--feature_selection",
+        type=str,
+        nargs="+",
+        default=["attn_score", "vector_norm"],
+        choices=[
+            "attn_score",
+            "vector_norm",
+            "vector_cv",
+            "vector_z_score",
+            "token_profiling",
+            "convolution",
+            "normalized_pos",
+        ],
+        help="Feature selection for lightweight model. Options: attn_score (attension score), vector_norm (l2 norm), vector_cv (coefficient of variation), vector_z_score (z-score), token_profiling (boolean for specials and punctuation tokens), convolution (selectable with --vector_convolution, adjustable to key, value, query, embedding).",
     )
 
     parser.add_argument(
@@ -413,6 +448,9 @@ def main(args: argparse.Namespace) -> None:
         "recent_window": args.recent_window,
         "model_type": args.model_type,
         "trained_weights": "none",  # train new weights
+        "vector_convolution": args.vector_convolution,
+        "convolution_features": args.convolution_features,
+        "feature_selection": args.feature_selection,
     }
     wandb.config.update(cache_kwargs)
 
