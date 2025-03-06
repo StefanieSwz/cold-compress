@@ -237,6 +237,29 @@ def save_lightweight(model: nn.Module, kwargs: Dict[str, Any], identifier: str) 
     return save_path
 
 
+def save_lightweight_temp(model: nn.Module, kwargs: Dict[str, Any]):
+    """
+    Save lightweight model parameters temporarily.
+
+    Returns:
+        (Path, TemporaryDirectory): Path to the saved file and the temporary directory object.
+        The caller is responsible for managing the lifetime of the temp directory.
+    """
+    temp_dir = tempfile.TemporaryDirectory()
+    save_path = Path(temp_dir.name) / "model.pth"
+
+    trained_weights = {
+        name: param
+        for name, param in model.state_dict().items()
+        if name in [n for n, p in model.named_parameters() if p.requires_grad]
+    }
+
+    torch.save(trained_weights, save_path)
+    print(f"Trained weights saved temporarily at {save_path}")
+
+    return save_path, temp_dir
+
+
 def load_trained_lightweight(
     model: nn.Module, checkpoint_path: Union[str, Path], load_kv: bool = True
 ) -> None:
@@ -263,9 +286,9 @@ def load_trained_lightweight(
 
     # Determine which substring to look for based on the target.
     if load_kv:
-        target_substring = "attention.kv_cache.models"
+        target_substring = "attention.kv_cache"
     elif not load_kv:
-        target_substring = "attention.prompt_compressor.models"
+        target_substring = "attention.prompt_compressor"
     else:
         raise ValueError("load_target must be either 'kv_cache' or 'prompt_compressor'")
 
@@ -1523,7 +1546,10 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         scores.masked_fill_(self.pos.view(scores.shape) == -1, float("-inf"))
 
         # Apply masking to protect recent tokens based on the observation window
-        scores.masked_fill_(self.pos >= input_pos - self.recent_window, float("inf"))
+        # squeeze pos as not batch compatible
+        scores.masked_fill_(
+            self.pos.squeeze(0) >= input_pos - self.recent_window, float("inf")
+        )
 
         # Evict least important token
         return torch.argmin(scores, dim=-1)
@@ -1545,7 +1571,6 @@ class KVCacheLightweight(KVCacheHeadSpecific):
             torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
         """
         max_cache_length = self.key_norm.shape[-1]
-        normalized_pos = self.pos.float() / input_pos[-1].float()
 
         features_to_cat = []
         if "attn_score" in self.feature_selection:
@@ -1589,6 +1614,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 buffer_attr = f"{feat}_conv_values"
                 features_to_cat.append(getattr(self, buffer_attr))
         if "normalized_pos" in self.feature_selection:
+            normalized_pos = self.pos.float() / input_pos[-1].float()
             features_to_cat.append(normalized_pos.unsqueeze(-1))
 
         features_to_cat = [feature.to(torch.bfloat16) for feature in features_to_cat]

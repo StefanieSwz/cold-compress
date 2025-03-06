@@ -3,10 +3,11 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from collections import defaultdict
 from typing import Optional, Dict, Any, List
 import pdb
+import json
 
 import math
 import torch
@@ -70,6 +71,13 @@ class ModelArgs:
             ), name  # make sure only one 'best' match
 
         return cls(**transformer_configs[config[0]])
+
+    def to_dict(self):
+        data = asdict(self)  # Convert the dataclass to a dictionary
+        data["rope_scaling"] = (
+            json.dumps(self.rope_scaling) if self.rope_scaling else None
+        )
+        return data
 
 
 transformer_configs = {
@@ -242,6 +250,8 @@ class Transformer(nn.Module):
                 # Add n_local_heads info to the layer_kwargs for the prompt compressor
                 layer_kwargs["n_heads"] = self.config.n_local_heads
                 layer_kwargs["dtype"] = dtype
+                layer_kwargs["head_dim"] = head_dim
+                layer_kwargs["config_dim"] = self.config.dim
 
             b.attention.prompt_compressor = get_prompt_compressor_constructor(
                 prompt_comp_strategy
@@ -394,10 +404,10 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def compress_prompt(self, input_pos, k_val, v_val, attn):
+    def compress_prompt(self, input_pos, k_val, v_val, attn, **kwargs):
         seq_len = input_pos.shape[0]
         if self.kv_cache.max_cache_length < seq_len:
-            kwargs = {"attn": attn}
+            kwargs["attn"] = attn
             return self.prompt_compressor(input_pos, k_val, v_val, **kwargs)
 
         return input_pos, k_val, v_val, attn
@@ -465,7 +475,11 @@ class Attention(nn.Module):
 
         # Prefill updates happen after since we don't use the KV cache for prefill attention
         if is_prefill:
-            input_pos, k, v, attn = self.compress_prompt(input_pos, k, v, attn)
+            cache_kwargs["feature_selection"] = self.kv_cache.feature_selection
+            cache_kwargs["convolution_features"] = self.kv_cache.convolution_features
+            input_pos, k, v, attn = self.compress_prompt(
+                input_pos, k, v, attn, **cache_kwargs
+            )
             self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
 
         # [Optional] Update the KV Cache internal state now that we have attention probabilities

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import pdb
+import math
 from abc import ABC, abstractmethod
 
 
@@ -158,32 +159,117 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific):
     def __init__(self, head_specific, **kwargs) -> None:
         super().__init__(head_specific, **kwargs)
 
+        self.feature_space_dim = 0  # Number of final features
+
+        # Get feature size
+        if "attn_score" in kwargs["feature_selection"]:
+            self.feature_space_dim += 1
+        if "vector_norm" in kwargs["feature_selection"]:
+            self.feature_space_dim += 4
+        if "vector_cv" in kwargs["feature_selection"]:
+            self.feature_space_dim += 4
+        if "vector_z_score" in kwargs["feature_selection"]:
+            self.feature_space_dim += 4
+        if "token_profiling" in kwargs["feature_selection"]:
+            self.special_ids = torch.tensor(
+                kwargs["token_ids"]["special"], dtype=torch.int32
+            )
+
+            self.punctuation_ids = torch.tensor(
+                kwargs["token_ids"]["punctuation"], dtype=torch.int32
+            )
+            self.feature_space_dim += 2
+        if "convolution" in kwargs["feature_selection"]:
+            self.conv_compression_rate = 16  # must be 2^x, keep at 16, otherwise double conv does not necessarily work
+            self.conv_hidden_channels = 4  # or 8
+            self.conv_layers = nn.ModuleDict()
+
+            # kwargs["convolution_features"] is a list like ["key", "value", "query", "embedding"]
+            for feat in kwargs["convolution_features"]:
+                if feat == "embedding":
+                    result_conv_dim = kwargs["config_dim"] // self.conv_compression_rate
+                else:
+                    result_conv_dim = kwargs["head_dim"] // self.conv_compression_rate
+                if kwargs["vector_convolution"] == "double_conv":
+                    self.conv_layers[feat] = nn.Sequential(
+                        nn.Conv1d(
+                            in_channels=1,
+                            out_channels=self.conv_hidden_channels,
+                            kernel_size=int(math.sqrt(self.conv_compression_rate)),
+                            stride=int(math.sqrt(self.conv_compression_rate)),
+                        ).to(torch.bfloat16),
+                        nn.ReLU(),
+                        nn.Conv1d(
+                            in_channels=self.conv_hidden_channels,
+                            out_channels=1,
+                            kernel_size=int(math.sqrt(self.conv_compression_rate)),
+                            stride=int(math.sqrt(self.conv_compression_rate)),
+                        ).to(torch.bfloat16),
+                    )
+                    self.feature_space_dim += result_conv_dim
+
+                elif kwargs["embedding_compression"] == "single_conv":
+                    self.conv_layers[feat] = nn.Sequential(
+                        nn.Conv1d(
+                            in_channels=1,
+                            out_channels=self.conv_hidden_channels,
+                            kernel_size=self.conv_compression_rate
+                            * self.conv_hidden_channels,
+                            stride=self.conv_compression_rate
+                            * self.conv_hidden_channels,
+                        ).to(torch.bfloat16),
+                        nn.ReLU(),
+                        nn.Flatten(),
+                    )
+                    self.feature_space_dim += result_conv_dim
+                else:
+                    print("No convolution feature initialized")
+        if "normalized_pos" in kwargs["feature_selection"]:
+            self.feature_space_dim += 1
         # Initialize lightweight models for computing token scores.
         if kwargs["model_type"] == "linear":
             self.models = nn.ModuleList(
-                [nn.Linear(3, 1).to(kwargs["dtype"]) for _ in range(kwargs["n_heads"])]
+                [
+                    nn.Linear(self.feature_space_dim, 1).to(kwargs["dtype"])
+                    for _ in range(kwargs["n_heads"])
+                ]
             )
         elif kwargs["model_type"] == "mlp":
+            self.lightweight_hidden_size = 16
             self.models = nn.ModuleList(
                 [
-                    nn.Sequential(nn.Linear(3, 16), nn.ReLU(), nn.Linear(16, 1)).to(
-                        kwargs["dtype"]
-                    )
+                    nn.Sequential(
+                        nn.Linear(self.feature_space_dim, self.lightweight_hidden_size),
+                        nn.ReLU(),
+                        nn.Linear(self.lightweight_hidden_size, 1),
+                    ).to(kwargs["dtype"])
                     for _ in range(kwargs["n_heads"])
                 ]
             )
         else:
             raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
 
+        def init_weights(m):
+            # You can choose a specific initialization for Conv1d and Linear layers
+            # if isinstance(m, (nn.Conv1d, nn.Linear)):
+            #     # For example, Kaiming normal initialization for layers with ReLU activation:
+            #     torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            #     if m.bias is not None:
+            #         torch.nn.init.constant_(m.bias, 0)
+            # Alternatively, if you prefer a normal distribution with mean=0 and std=0.02:
+            if hasattr(m, "weight") and m.weight is not None:
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if hasattr(m, "bias") and m.bias is not None:
+                torch.nn.init.normal_(m.bias, mean=0.0, std=0.02)
+
         # Initialize the models' parameters with random weights.
         # Trained weights are loaded from model perspective
         with torch.no_grad():
+            if "convolution" in kwargs["feature_selection"]:
+                for feat, conv_block in self.conv_layers.items():
+                    conv_block.apply(init_weights)
             for model in self.models:
-                for name, param in model.named_parameters():
-                    if "weight" in name:
-                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
-                    elif "bias" in name:
-                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
+                model.apply(init_weights)
 
     def _token_importances(self, input_pos, k_val, v_val, **kwargs):
         """
@@ -202,22 +288,130 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific):
             torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
         """
         seq_len = input_pos.shape[-1]
-        attn = kwargs["attn"]
-        attn_scores = attn.mean(dim=2)
-        key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
-        value_norm = torch.linalg.vector_norm(v_val, ord=2, dim=-1)
-
-        # Extract features from the entire cache
-        features = torch.stack(
-            [
-                key_norm,  # [batch_size, n_heads, seq_len]
-                value_norm,  # [batch_size, n_heads, seq_len]
-                attn_scores,  # [batch_size, n_heads, seq_len]
-            ],
-            dim=-1,  # Resulting shape: [batch_size, n_heads, seq_len, 3]
+        features_to_cat = []
+        x_expanded = (
+            kwargs["x"].unsqueeze(1).expand(-1, k_val.shape[1], *kwargs["x"].shape[1:])
         )
+        n_heads = k_val.shape[1]
+        batch_size, n_query_heads, _, head_dim = kwargs["query"].shape
+        group_size = n_query_heads // n_heads
+        q_grouped = kwargs["query"].view(
+            batch_size, n_heads, group_size, seq_len, head_dim
+        )
+        q_avg = q_grouped.mean(dim=2)  # [batch_size, n_heads, seq_len, head_dim]
 
-        # Initialize scores with -infinity for all cache slots
+        if "attn_score" in kwargs["feature_selection"]:
+            attn = kwargs["attn"]
+            attn_score = attn.mean(dim=2)
+            features_to_cat.append(attn_score.unsqueeze(-1))
+        if "vector_norm" in kwargs["feature_selection"]:
+            key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
+            value_norm = torch.linalg.vector_norm(v_val, ord=2, dim=-1)
+            query_norm = torch.linalg.vector_norm(q_avg, ord=2, dim=-1)
+            embedding_norm = torch.linalg.vector_norm(x_expanded, ord=2, dim=-1)
+            features_to_cat.extend(
+                [
+                    key_norm.unsqueeze(-1),
+                    value_norm.unsqueeze(-1),
+                    query_norm.unsqueeze(-1),
+                    embedding_norm.unsqueeze(-1),
+                ]
+            )
+        if "vector_cv" in kwargs["feature_selection"]:
+            key_cv = torch.std(k_val, dim=-1, unbiased=False) / torch.mean(
+                k_val, dim=-1
+            )
+            value_cv = torch.std(v_val, dim=-1, unbiased=False) / torch.mean(
+                v_val, dim=-1
+            )
+            query_cv = torch.std(q_avg, dim=-1, unbiased=False) / torch.mean(
+                q_avg, dim=-1
+            )
+            embedding_cv = torch.std(x_expanded, dim=-1, unbiased=False) / torch.mean(
+                x_expanded, dim=-1
+            )
+            features_to_cat.extend(
+                [
+                    key_cv.unsqueeze(-1),
+                    value_cv.unsqueeze(-1),
+                    query_cv.unsqueeze(-1),
+                    embedding_cv.unsqueeze(-1),
+                ]
+            )
+        if "vector_z_score" in kwargs["feature_selection"]:
+            key_z = (
+                torch.max(k_val, dim=-1).values - torch.mean(k_val, dim=-1)
+            ) / torch.std(k_val, dim=-1, unbiased=False)
+            value_z = (
+                torch.max(v_val, dim=-1).values - torch.mean(v_val, dim=-1)
+            ) / torch.std(v_val, dim=-1, unbiased=False)
+            query_z = (
+                torch.max(q_avg, dim=-1).values - torch.mean(q_avg, dim=-1)
+            ) / torch.std(q_avg, dim=-1, unbiased=False)
+            embedding_z = (
+                torch.max(x_expanded, dim=-1).values - torch.mean(x_expanded, dim=-1)
+            ) / torch.std(x_expanded, dim=-1, unbiased=False)
+            features_to_cat.extend(
+                [
+                    key_z.unsqueeze(-1),
+                    value_z.unsqueeze(-1),
+                    query_z.unsqueeze(-1),
+                    embedding_z.unsqueeze(-1),
+                ]
+            )
+        if "token_profiling" in kwargs["feature_selection"]:
+            B, seq_len = kwargs["input_ids"].shape
+            special_ids_mask = torch.isin(
+                kwargs["input_ids"], self.special_ids
+            )  # Shape: [B, seq_len]
+            token_special_profiling = special_ids_mask.unsqueeze(1).expand(
+                B, n_heads, seq_len
+            )
+
+            punct_ids_mask = torch.isin(
+                kwargs["input_ids"], self.punctuation_ids
+            )  # Shape: [B, seq_len]
+            token_punctuation_profiling = punct_ids_mask.unsqueeze(1).expand(
+                B, n_heads, seq_len
+            )
+            features_to_cat.extend(
+                [
+                    token_special_profiling.unsqueeze(-1),
+                    token_punctuation_profiling.unsqueeze(-1),
+                ]
+            )
+        if "convolution" in kwargs["feature_selection"]:
+            feature_dict = {
+                "embedding": x_expanded,
+                "query": q_avg,
+                "key": k_val,
+                "value": v_val,
+            }  # all (batch, n_heads, seq_len, dim/head_dim)
+            for feat in kwargs["convolution_features"]:
+                feat_tensor = feature_dict[feat]  # shape: [B, H, M, D]
+                feat_tensor_reshaped = feat_tensor.reshape(
+                    batch_size * n_heads * seq_len, 1, feat_tensor.shape[-1]
+                )
+                conv_out = self.conv_layers[feat](
+                    feat_tensor_reshaped
+                )  # shape: [N_valid, 1, F]
+                conv_out_reshaped = conv_out.reshape(
+                    batch_size, n_heads, seq_len, -1
+                )  # shape: [B, H, M, F]
+                features_to_cat.append(conv_out_reshaped)
+        if "normalized_pos" in kwargs["feature_selection"]:
+            normalized_pos = input_pos.float() / input_pos[-1].float()
+            features_to_cat.append(
+                normalized_pos.unsqueeze(0)
+                .unsqueeze(0)
+                .expand(batch_size, n_heads, -1)
+                .unsqueeze(-1)
+            )
+
+        features_to_cat = [feature.to(torch.bfloat16) for feature in features_to_cat]
+        features = torch.cat(features_to_cat, dim=3)
+
+        # Initialize scores with -infinity for complete sequence len
         priority = torch.full(
             (features.shape[0], features.shape[1], seq_len),
             float("-inf"),
@@ -237,6 +431,7 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific):
         return priority
 
     def _update_state(self, keep_idxs, input_pos, **kwargs):
+        # only update attention, rest is done in kv_cache.update_state()
         seq_len = input_pos.shape[-1]
         # Return average attention across prompt to insert into KV Cache's attention history tracker
         cum_attn = kwargs["attn"].sum(dim=2) / (seq_len - input_pos)

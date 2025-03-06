@@ -392,13 +392,17 @@ def setup_caches(
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)
         if cache_kwargs["cache_strategy"][0] == "lightweight":
-            file = Path(cache_kwargs["trained_weights"])
-            if file.exists() and file.is_file():
-                load_trained_lightweight(model, file, load_kv=True)
+            trained_weights = cache_kwargs.get("trained_weights")
+            if isinstance(trained_weights, str) and Path(trained_weights).exists():
+                file = Path(trained_weights)
+                if file.is_file():
+                    load_trained_lightweight(model, file, load_kv=True)
         if cache_kwargs["prompt_compression_strategy"][0] == "lightweight":
-            file = Path(cache_kwargs["trained_weights"])
-            if file.exists() and file.is_file():
-                load_trained_lightweight(model, file, load_kv=False)
+            trained_weights = cache_kwargs.get("trained_weights")
+            if isinstance(trained_weights, str) and Path(trained_weights).exists():
+                file = Path(trained_weights)
+                if file.is_file():
+                    load_trained_lightweight(model, file, load_kv=True)
     return cache_kwargs
 
 

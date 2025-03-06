@@ -4,10 +4,12 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import sys
+import os
 import time
 import argparse
 import math
 import json
+import pdb
 import regex as re
 import contextlib
 import shutil
@@ -19,13 +21,20 @@ from typing import Optional, List
 from collections import defaultdict, Counter
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
+import wandb
+import tempfile
 
 import torch
 import torch._dynamo.config
 import torch._inductor.config
 
-from cache import add_cache_arguments, cache_compatibility, get_cache_constructor
-from model import Transformer
+from cache import (
+    add_cache_arguments,
+    cache_compatibility,
+    get_cache_constructor,
+    load_trained_lightweight,
+)
+from model import Transformer, ModelArgs
 from generation_utils import (
     add_generation_arguments,
     compile_funcs,
@@ -137,6 +146,21 @@ def args_to_str(args):
         )
         + debug_suffix
     )
+
+
+def serialize_value(v):
+    """Convert non-serializable objects to JSON-compatible types."""
+    if isinstance(v, Path):
+        return str(v)  # Convert Path to string
+    elif isinstance(v, torch.Tensor):
+        return v.tolist()  # Convert Tensor to list
+    elif isinstance(v, argparse.Namespace):
+        return vars(v)  # Convert Namespace to dict
+    elif isinstance(v, set):
+        return list(v)  # Convert set to list
+    elif isinstance(v, ModelArgs):
+        return v.to_dict()
+    return v  # Keep other values as they are
 
 
 def run_task(
@@ -340,6 +364,43 @@ def main(
     global print
     from tp import maybe_init_dist
 
+    if args.use_wandb:
+        # Init wandb
+        wandb_api_key = os.getenv("WANDB_API_KEY")
+        wandb_project = os.getenv("WANDB_PROJECT")
+        wandb_entity = os.getenv("WANDB_ENTITY")
+        wandb_account = os.getenv("WANDB_ACCOUNT")
+        wandb_model_registry = os.getenv("WANDB_MODEL_REGISTRY")
+
+        # Validate that all required environment variables are present
+        if not wandb_api_key:
+            raise ValueError("WANDB_API_KEY environment variable is not set.")
+        if not wandb_project:
+            raise ValueError("WANDB_PROJECT environment variable is not set.")
+        if not wandb_entity:
+            raise ValueError("WANDB_ENTITY environment variable is not set.")
+        if not wandb_account:
+            raise ValueError("WANDB_ACCOUNT environment variable is not set.")
+        if not wandb_model_registry:
+            raise ValueError("WANDB_MODEL_REGISTRY environment variable is not set.")
+
+        wandb.login(key=wandb_api_key)
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            config=vars(args),
+        )
+        # registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
+        # execute eval directly after training
+        artifact = wandb.use_artifact("lightweight_model:latest", type="model")
+        print("Artifact contents:", artifact.file())
+        temp_dir_obj = tempfile.TemporaryDirectory()  # Keep reference, don't use `with`
+        temp_dir = temp_dir_obj.name  # Get the path
+        artifact.download(root=temp_dir)  # Download to a temp directory
+        print("Files in temp_dir:", os.listdir(temp_dir))
+        model_path = os.path.join(temp_dir, "model.pth")
+        cache_kwargs["trained_weights"] = model_path
+
     rank = maybe_init_dist()
     use_tp = rank is not None
     if use_tp:
@@ -363,7 +424,10 @@ def main(
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path, is_chat=is_chat)
 
-    if cache_kwargs["cache_strategy"] == "hybrid":
+    if (
+        cache_kwargs["cache_strategy"] == "hybrid"
+        or cache_kwargs["cache_strategy"] == "lightweight"
+    ):
         # We need to pass the special and punctuation token ids to the cache via cache_kwargs
         cache_kwargs["token_ids"] = {
             "special": tokenizer.special_ids(),
@@ -434,28 +498,57 @@ def main(
             with open(task_args_out_fn, "w") as fd:
                 print(f"Saving dynamic args for {task_name} to {task_args_out_fn}")
                 # Convert Path objects to strings
-                task_args_json = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in task_args.items()
-                }
+                task_args_json = {k: serialize_value(v) for k, v in task_args.items()}
                 json.dump(task_args_json, fd, indent=4)
+
+            if args.use_wandb:
+                artifact = wandb.Artifact(
+                    name="evaluation_results",
+                    type="evaluation",
+                    metadata={
+                        "tasks": task_name,
+                        "model_checkpoint": str(checkpoint_path),
+                    },
+                )
+
+                # Add general result files
+                if args_fn.exists():
+                    artifact.add_file(str(args_fn))  # Save args
+                if all_out_fn.exists():
+                    artifact.add_file(str(all_out_fn))  # Save all metrics
+
+                # Add each task's results
+                if task_out_fn.exists():
+                    artifact.add_file(str(task_out_fn))
+                if task_args_out_fn.exists():
+                    artifact.add_file(str(task_args_out_fn))
+                if pred_out_fn.exists():
+                    artifact.add_file(str(pred_out_fn))
+
+                # Log to W&B
+                wandb.log_artifact(artifact)
+                print("✅ W&B Artifact saved with all evaluation results.")
 
         if not args_fn.exists():
             # Only save args once and only save if we've gotten through a full eval and are ready to dump metrics
             with open(args_fn, "w") as fd:
                 # Convert Path objects to strings
                 cache_kwargs_json = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in cache_kwargs.items()
+                    k: serialize_value(v) for k, v in cache_kwargs.items()
                 }
                 json.dump(cache_kwargs_json, fd, indent=4)
 
     with open(all_out_fn, "w") as fd:
         json.dump(task_metrics, fd, indent=4)
 
+    if args.use_wandb:
+        temp_dir_obj.cleanup()
+        wandb.finish()
+
 
 def setup(args) -> Path:
-    sub_dir = args_to_str(args) if args.out_dir is None else args.out_dir
+    # sub_dir = args_to_str(args) if args.out_dir is None else args.out_dir
+    sub_dir = time.strftime("%Y%m%d_%H%M%S")
     out_dir = (
         Path(__file__).parent
         / "results"
@@ -539,6 +632,13 @@ def add_eval_args(parser):
         default=False,
         action="store_true",
         help="If True will truncate cache after prefill and then decode the first token.",
+    )
+
+    parser.add_argument(
+        "--use_wandb",
+        type=bool,
+        default=False,
+        help="If weights and biases should be used during evaluation for loading the lightweight model or saving the eval results as artifacts.",
     )
 
 

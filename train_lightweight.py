@@ -20,7 +20,7 @@ from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
-from cache import save_lightweight
+from cache import save_lightweight_temp
 
 from generation_utils import (
     load_model,
@@ -220,7 +220,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         "--convolution_features",
         type=str,
         nargs="+",
-        default=["embedding"],
+        default=["key", "value", "query", "embedding"],
         choices=["key", "value", "query", "embedding"],
         help="Which features to compress using the convolutional layer.",
     )
@@ -229,7 +229,15 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         "--feature_selection",
         type=str,
         nargs="+",
-        default=["attn_score", "vector_norm"],
+        default=[
+            "attn_score",
+            "vector_norm",
+            "vector_cv",
+            "vector_z_score",
+            "token_profiling",
+            "convolution",
+            "normalized_pos",
+        ],
         choices=[
             "attn_score",
             "vector_norm",
@@ -334,6 +342,13 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         help="Recent window size.",
     )
 
+    parser.add_argument(
+        "--evaluate",
+        type=bool,
+        default=False,
+        help="If set to true, the evaluation script is called and result artifacts are saved in the same wandb run.",
+    )
+
 
 def prepare_dataset(
     tokenizer: nn.Module, args: argparse.Namespace
@@ -436,7 +451,7 @@ def main(args: argparse.Namespace) -> None:
         "compile": False,
         "device": device,
         "max_cache_length": [1.0],
-        "cache_bits": None,  # dont quantice cache
+        "cache_bits": None,  # dont quantize cache
         "cache_length_pattern": args.cache_length_pattern,
         "cache_strategy": ["lightweight"],
         "cache_strategy_pattern": "repeat",
@@ -459,7 +474,7 @@ def main(args: argparse.Namespace) -> None:
     train_loader, val_loader = prepare_dataset(tokenizer, args)
 
     for name, param in model.named_parameters():
-        if "attention.kv_cache.models" in name:
+        if "attention.kv_cache" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -577,10 +592,10 @@ def main(args: argparse.Namespace) -> None:
 
         model.train()  # Switch back to training mode
         # model.set_train_mode(True)
-        save_path = save_lightweight(
-            model, cache_kwargs, timestamp
+        save_path, temp_dir = save_lightweight_temp(
+            model, cache_kwargs
         )  # override weights each epoch
-        print(f"Model saved to {save_path}")
+        print(f"Model saved temporarly to {save_path}")
 
         parent_model_name = Path(checkpoint_path).parent.name
         final = False
@@ -590,7 +605,7 @@ def main(args: argparse.Namespace) -> None:
             final = True
 
         artifact = wandb.Artifact(
-            name="model.pth",
+            name="lightweight_model",
             type="model",
             metadata={
                 "epoch": epoch + 1,
@@ -600,7 +615,7 @@ def main(args: argparse.Namespace) -> None:
                 "parent_model": parent_model_name,
                 "final": final,
             },
-        )
+        )  # save one file per artifact
         artifact.add_file(save_path)
         run.link_artifact(
             artifact=artifact,
