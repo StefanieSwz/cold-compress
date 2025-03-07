@@ -285,29 +285,27 @@ def load_trained_lightweight(
     model_state: Dict[str, torch.Tensor] = model.state_dict()
 
     # Determine which substring to look for based on the target.
-    if load_kv:
-        target_substring = "attention.kv_cache"
-    elif not load_kv:
-        target_substring = "attention.prompt_compressor"
-    else:
-        raise ValueError("load_target must be either 'kv_cache' or 'prompt_compressor'")
+    trained_key_substring = "attention.kv_cache"
+    model_key_substring = (
+        "attention.kv_cache" if load_kv else "attention.prompt_compressor"
+    )
 
     # Filter weights: update only those keys that are both in the model state
     # and correspond to the desired target.
-    matched_weights = {
-        k: v
+    remapped_weights = {
+        k.replace(trained_key_substring, model_key_substring): v
         for k, v in trained_weights.items()
-        if k in model_state and target_substring in k
+        if k.replace(trained_key_substring, model_key_substring) in model_state
     }
-    unmatched_weights = set(trained_weights.keys()) - set(matched_weights.keys())
+    unmatched_weights = set(trained_weights.keys()) - set(remapped_weights.keys())
     assert (
         not unmatched_weights
-    ), f"The following weights were not found in the model for {target_substring}: {unmatched_weights}"
+    ), f"The following weights were not found in the model for {model_key_substring}: {unmatched_weights}"
 
     # Update and load state.
-    model_state.update(matched_weights)
+    model_state.update(remapped_weights)
     model.load_state_dict(model_state)
-    print(f"Loaded trained weights for {target_substring} from {checkpoint_path}")
+    print(f"Loaded trained weights for {model_key_substring} from {checkpoint_path}")
 
 
 def load_best_lightweight_model_wb(
