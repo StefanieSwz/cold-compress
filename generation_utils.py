@@ -402,7 +402,7 @@ def setup_caches(
             if isinstance(trained_weights, str) and Path(trained_weights).exists():
                 file = Path(trained_weights)
                 if file.is_file():
-                    load_trained_lightweight(model, file, load_kv=True)
+                    load_trained_lightweight(model, file, load_kv=False)
     return cache_kwargs
 
 
