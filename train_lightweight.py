@@ -232,11 +232,11 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         default=[
             "attn_score",
             "vector_norm",
-            "vector_cv",
-            "vector_z_score",
-            "token_profiling",
-            "convolution",
-            "normalized_pos",
+            # "vector_cv",
+            # "vector_z_score",
+            # "token_profiling",
+            # "convolution",
+            # "normalized_pos",
         ],
         choices=[
             "attn_score",
@@ -303,7 +303,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=2048,
+        default=1024,
         help="Maximum sequence length for training.",
     )
 
