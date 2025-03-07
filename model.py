@@ -475,9 +475,11 @@ class Attention(nn.Module):
 
         # Prefill updates happen after since we don't use the KV cache for prefill attention
         if is_prefill:
-            if isinstance(self.kv_cache, KVCacheLightweight)
+            if isinstance(self.kv_cache, KVCacheLightweight):
                 cache_kwargs["feature_selection"] = self.kv_cache.feature_selection
-                cache_kwargs["convolution_features"] = self.kv_cache.convolution_features
+                cache_kwargs["convolution_features"] = (
+                    self.kv_cache.convolution_features
+                )
             input_pos, k, v, attn = self.compress_prompt(
                 input_pos, k, v, attn, **cache_kwargs
             )
