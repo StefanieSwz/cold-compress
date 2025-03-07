@@ -324,7 +324,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--cache_length_pattern",
         type=str,
-        default="pyramid",
+        default="tile",
         help="Cache length pattern.",
     )
 

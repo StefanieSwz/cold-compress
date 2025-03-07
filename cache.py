@@ -624,7 +624,6 @@ class KVCache(ABC, nn.Module):
         """
         A simple utility to fill the cache and pos.
         """
-        pdb.set_trace()
         self.pos[:, :, fill_idxs] = input_pos
         self.k_cache[:, :, fill_idxs, :] = k_val
         self.v_cache[:, :, fill_idxs, :] = v_val
