@@ -540,6 +540,7 @@ def main(args: argparse.Namespace) -> None:
                         * args.gradient_accumulation_steps
                     }
                 )
+            reset_caches(model)
 
         avg_train_loss = total_loss / len(train_loader)
         print(
