@@ -22,11 +22,7 @@ from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 from tokenizer import get_tokenizer, TokenizersChatFormat
 from cache import save_lightweight_temp
 
-from generation_utils import (
-    load_model,
-    device_sync,
-    setup_caches,
-)
+from generation_utils import load_model, device_sync, setup_caches, reset_caches
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -585,6 +581,7 @@ def main(args: argparse.Namespace) -> None:
                 )  # validation loss computed based on the scaled tensors not the compressed sequence
                 total_val_loss += val_loss.item()
                 # wandb.log({"val_batch_loss": val_loss.item()})
+                reset_caches(model)
 
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
