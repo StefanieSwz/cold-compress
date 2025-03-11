@@ -266,46 +266,56 @@ def load_trained_lightweight(
     """
     Load trained weights into a model, updating only matching layers for the specified target.
 
-    This function loads a checkpoint and updates the model's parameters with
-    those weights that match keys in the model's state dictionary. Only weights
-    for the specified target are loaded.
+    This function renames trained weights (if needed), matches them with model keys,
+    and updates the model accordingly.
 
     Args:
         model (nn.Module): The model to load weights into.
         checkpoint_path (Union[str, Path]): Path to the saved weights.
-        load_kv (bool): Which target to load weights for. Options:
-                           True for KV-Cache or "prompt_compressor".
+        load_kv (bool): Determines which target to load weights for.
+                        True -> Load KV-Cache ("attention.kv_cache")
+                        False -> Load Prompt Compressor ("attention.prompt_compressor")
 
     Returns:
         None
     """
+    # Load trained weights
     trained_weights: Dict[str, torch.Tensor] = torch.load(
         checkpoint_path, map_location="cpu"
     )
     model_state: Dict[str, torch.Tensor] = model.state_dict()
 
-    # Determine which substring to look for based on the target.
-    trained_key_substring = "attention.kv_cache"
+    # Define substrings for model and trained weights
+    trained_key_substring = "attention.kv_cache"  # Always in trained weights
     model_key_substring = (
         "attention.kv_cache" if load_kv else "attention.prompt_compressor"
     )
 
-    # Filter weights: update only those keys that are both in the model state
-    # and correspond to the desired target.
-    remapped_weights = {
-        k.replace(trained_key_substring, model_key_substring): v
-        for k, v in trained_weights.items()
-        if k.replace(trained_key_substring, model_key_substring) in model_state
-    }
-    unmatched_weights = set(trained_weights.keys()) - set(remapped_weights.keys())
+    remapped_weights = {}
+
+    if not load_kv:
+        # Rename trained weights to fit the model's "attention.prompt_compressor" structure
+        for trained_key, weight in trained_weights.items():
+            if trained_key_substring in trained_key:
+                model_key = trained_key.replace(
+                    trained_key_substring, model_key_substring
+                )
+                if model_key in model_state:  # Ensure it's a valid model weight
+                    remapped_weights[model_key] = weight
+    else:
+        remapped_weights = trained_weights  # No renaming needed for KV-cache
+
+    # Ensure all trained weights have a matching model weight
+    unmatched_weights = set(remapped_weights.keys()) - set(model_state.keys())
     assert (
         not unmatched_weights
-    ), f"The following weights were not found in the model for {model_key_substring}: {unmatched_weights}"
+    ), f"⚠️ The following trained weights did not match any model weights: {unmatched_weights}"
 
-    # Update and load state.
+    # Load the updated weights into the model
     model_state.update(remapped_weights)
-    model.load_state_dict(model_state)
-    print(f"Loaded trained weights for {model_key_substring} from {checkpoint_path}")
+    model.load_state_dict(model_state, strict=False)
+
+    print(f"✅ Loaded trained weights for {model_key_substring} from {checkpoint_path}")
 
 
 def load_best_lightweight_model_wb(
@@ -938,8 +948,11 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 "token_punctuation_profiling", torch.zeros(score_shape, dtype=dtype)
             )
             self.feature_space_dim += 2
-        if "convolution" in kwargs["feature_selection"]:
+        if (
+            "convolution" in kwargs["feature_selection"]
+        ):  # TODO: normalize after convolution
             self.conv_compression_rate = 16  # must be 2^x, keep at 16, otherwise double conv does not necessarily work
+            # TODO: map based on dim size
             self.conv_hidden_channels = 4  # or 8
             self.conv_layers = nn.ModuleDict()
 
@@ -1012,7 +1025,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 [nn.Linear(self.feature_space_dim, 1).to(dtype) for _ in range(n_heads)]
             )
         elif kwargs["model_type"] == "mlp":
-            self.lightweight_hidden_size = 16
+            self.lightweight_hidden_size = 16  # TODO: adapt to feature space, bigger then imput features, mult 2 of features
             self.models = nn.ModuleList(
                 [
                     nn.Sequential(
@@ -1403,6 +1416,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                     conv_out = self.conv_layers[feat](tokens_for_conv).squeeze(
                         1
                     )  # shape: [N_valid, F]
+                    # TODO: normalize between 1 and 0 , min max, or softmax
 
                     # Scatter the convolution output back into the appropriate buffer.
                     # Assume the buffer is stored as an attribute named, for example, "embedding_conv_values".

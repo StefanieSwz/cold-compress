@@ -392,14 +392,18 @@ def main(
         )
         # registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
         # execute eval directly after training
-        artifact = wandb.use_artifact("lightweight_model:latest", type="model")
-        print("Artifact contents:", artifact.file())
-        temp_dir_obj = tempfile.TemporaryDirectory()  # Keep reference, don't use `with`
-        temp_dir = temp_dir_obj.name  # Get the path
-        artifact.download(root=temp_dir)  # Download to a temp directory
-        print("Files in temp_dir:", os.listdir(temp_dir))
-        model_path = os.path.join(temp_dir, "model.pth")
-        cache_kwargs["trained_weights"] = model_path
+        if "lightweight" in cache_kwargs["cache_strategy"]:
+            artifact = wandb.use_artifact("lightweight_model:latest", type="model")
+            print("Artifact contents:", artifact.file())
+            temp_dir_obj = (
+                tempfile.TemporaryDirectory()
+            )  # Keep reference, don't use `with`
+            temp_dir = temp_dir_obj.name  # Get the path
+            artifact.download(root=temp_dir)  # Download to a temp directory
+            print("Files in temp_dir:", os.listdir(temp_dir))
+            model_path = os.path.join(temp_dir, "model.pth")
+            cache_kwargs["trained_weights"] = model_path
+            print(f"Using lightweight model from {model_path}")
 
     rank = maybe_init_dist()
     use_tp = rank is not None
@@ -542,7 +546,8 @@ def main(
         json.dump(task_metrics, fd, indent=4)
 
     if args.use_wandb:
-        temp_dir_obj.cleanup()
+        if cache_kwargs["cache_strategy"] == "lightweight":
+            temp_dir_obj.cleanup()
         wandb.finish()
 
 

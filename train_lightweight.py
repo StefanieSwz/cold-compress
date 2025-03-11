@@ -3,11 +3,11 @@ import sys
 import time
 import argparse
 import signal
-import pdb
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
+import subprocess
 import wandb
 from tqdm import tqdm
 import torch
@@ -278,21 +278,21 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=5,
+        default=5,  # TODO: 8 or 16
         help="Number of gradient accumulation steps.",
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
+        default=5,  # TODO: higher
         help="Number of training epochs.",
     )
 
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-6,
+        default=3e-6,  # 1e-3 -- e-6 --> see which gives best convergence
         help="Learning rate for training.",
     )
 
@@ -313,7 +313,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=1000,
+        default=1000,  # TODO: 95 % train, 5% val and whole dataset
         help="Number of examples to sample for evaluation. Defaults to -1, which uses the full dataset.",
     )
 
@@ -469,6 +469,7 @@ def main(args: argparse.Namespace) -> None:
 
     train_loader, val_loader = prepare_dataset(tokenizer, args)
 
+    # TODO: count trainable parameters --> less then 10 %
     for name, param in model.named_parameters():
         if "attention.kv_cache" in name:
             param.requires_grad = True
@@ -621,6 +622,42 @@ def main(args: argparse.Namespace) -> None:
         )
 
     wandb.finish()
+
+    if args.evaluate:
+        eval_command = [
+            "python",
+            "eval.py",
+            "--tasks",
+            "ultrachat",
+            "--use_wandb",
+            "True",
+            "--checkpoint_path",
+            str(args.checkpoint_path),
+            # "--compile",
+            # "--cache_length_pattern", args.cache_length_pattern," # default "tile"
+            "--cache_strategy",
+            "lightweight",
+            "--cache_strategy_pattern",
+            "repeat",
+            "--prompt_compression_strategy",
+            "lightweight",
+            "--global_tokens",
+            args.global_tokens,
+            "--recent_window",
+            args.recent_window,
+            "--model_type",
+            args.model_type,
+            "--vector_convolution",
+            args.vector_convolution,
+            "--convolution_features",
+            *args.convolution_features,
+            "--feature_selection",
+            *args.feature_selection,
+            "--trained_weights",
+            "none",
+        ]
+        print(f"Executing evaluation script with arguments: {eval_command}")
+        subprocess.run(eval_command)
 
 
 if __name__ == "__main__":

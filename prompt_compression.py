@@ -150,14 +150,15 @@ class PromptCompressorRecentGlobal(PromptCompressorHeadConstant):
         )
 
 
-class PromptCompressorLightweight(PromptCompressorHeadSpecific):
+class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
     """
     Use SnapKV to compress the prompt
     Based on the pseudo code on Page 7 of https://arxiv.org/abs/2404.14469
     """
 
     def __init__(self, head_specific, **kwargs) -> None:
-        super().__init__(head_specific, **kwargs)
+        PromptCompressorHeadSpecific.__init__(self, head_specific, **kwargs)
+        nn.Module.__init__(self)
 
         self.feature_space_dim = 0  # Number of final features
 

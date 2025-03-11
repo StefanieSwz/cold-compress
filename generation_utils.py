@@ -2,6 +2,7 @@ import itertools
 import time
 from typing import Optional, Tuple
 from pathlib import Path
+import pdb
 
 import torch
 import torch._dynamo.config
@@ -391,6 +392,7 @@ def setup_caches(
 
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)
+        pdb.set_trace()
         if cache_kwargs["cache_strategy"][0] == "lightweight":
             trained_weights = cache_kwargs.get("trained_weights")
             if isinstance(trained_weights, str) and Path(trained_weights).exists():
