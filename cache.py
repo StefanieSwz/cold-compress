@@ -1249,7 +1249,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
                     conv_buffer[
                         valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
-                    ] = conv_out
+                    ] = conv_out.detach()
 
         else:
             # Generation phase: update only the new token's key and value norms,
