@@ -761,7 +761,7 @@ NOTE: You should only predict the next line in the current file. Do not produce 
         }
 
 
-class UltraChatTask(EvaluationTask):
+class UltraChat(EvaluationTask):
     """
     UltraChatTask is an evaluation task for chat-based dialogue generation.
 
@@ -952,7 +952,7 @@ TASK_MAPPING = {
     "squality": Squality,
     "triviaqa": TriviaQA,
     "truthfulqa": TruthfulQA,
-    "ultrachat": UltraChatTask,
+    "ultrachat": UltraChat,
 }
 
 

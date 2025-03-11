@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-import pdb
-import math
 from abc import ABC, abstractmethod
+
+from cache_utils import get_convolution_params
 
 
 class PromptCompressor(ABC):
@@ -181,30 +181,38 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
             )
             self.feature_space_dim += 2
         if "convolution" in kwargs["feature_selection"]:
-            self.conv_compression_rate = 16  # must be 2^x, keep at 16, otherwise double conv does not necessarily work
-            self.conv_hidden_channels = 4  # or 8
             self.conv_layers = nn.ModuleDict()
 
             # kwargs["convolution_features"] is a list like ["key", "value", "query", "embedding"]
             for feat in kwargs["convolution_features"]:
                 if feat == "embedding":
-                    result_conv_dim = kwargs["config_dim"] // self.conv_compression_rate
+                    input_dim = kwargs["config_dim"]
                 else:
-                    result_conv_dim = kwargs["head_dim"] // self.conv_compression_rate
+                    input_dim = kwargs["head_dim"]
+                (
+                    kernel_1,
+                    kernel_2,
+                    self.conv_compression_rate,
+                    self.conv_hidden_channels,
+                ) = get_convolution_params(input_dim, target_features=6)
+                # must be 2^x, otherwise double conv does not necessarily work
+                # self.conv_compression_rate = 16
+                result_conv_dim = input_dim // self.conv_compression_rate
+
                 if kwargs["vector_convolution"] == "double_conv":
                     self.conv_layers[feat] = nn.Sequential(
                         nn.Conv1d(
                             in_channels=1,
                             out_channels=self.conv_hidden_channels,
-                            kernel_size=int(math.sqrt(self.conv_compression_rate)),
-                            stride=int(math.sqrt(self.conv_compression_rate)),
+                            kernel_size=kernel_1,
+                            stride=kernel_1,
                         ).to(torch.bfloat16),
                         nn.ReLU(),
                         nn.Conv1d(
                             in_channels=self.conv_hidden_channels,
                             out_channels=1,
-                            kernel_size=int(math.sqrt(self.conv_compression_rate)),
-                            stride=int(math.sqrt(self.conv_compression_rate)),
+                            kernel_size=kernel_2,
+                            stride=kernel_2,
                         ).to(torch.bfloat16),
                     )
                     self.feature_space_dim += result_conv_dim
@@ -236,7 +244,7 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
                 ]
             )
         elif kwargs["model_type"] == "mlp":
-            self.lightweight_hidden_size = 16
+            self.lightweight_hidden_size = self.feature_space_dim * 2
             self.models = nn.ModuleList(
                 [
                     nn.Sequential(
@@ -396,6 +404,19 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
                 conv_out = self.conv_layers[feat](
                     feat_tensor_reshaped
                 )  # shape: [N_valid, 1, F]
+
+                # Min-Max Normalization
+                conv_out_min = conv_out.min(dim=-1, keepdim=True)[0]
+                conv_out_max = conv_out.max(dim=-1, keepdim=True)[0]
+                range_ = conv_out_max - conv_out_min
+
+                # Normalize only where range_ > 0, otherwise set to 0
+                conv_out = torch.where(
+                    range_ > 0,
+                    (conv_out - conv_out_min) / range_,
+                    torch.zeros_like(conv_out),
+                )
+
                 conv_out_reshaped = conv_out.reshape(
                     batch_size, n_heads, seq_len, -1
                 )  # shape: [B, H, M, F]

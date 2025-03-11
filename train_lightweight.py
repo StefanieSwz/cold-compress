@@ -3,11 +3,11 @@ import sys
 import time
 import argparse
 import signal
+import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
-import subprocess
 import wandb
 from tqdm import tqdm
 import torch
@@ -20,8 +20,7 @@ from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
-from cache import save_lightweight_temp
-
+from cache_utils import save_lightweight_temp
 from generation_utils import load_model, device_sync, setup_caches, reset_caches
 
 torch._inductor.config.coordinate_descent_tuning = True
@@ -226,12 +225,12 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         type=str,
         nargs="+",
         default=[
-            "attn_score",
-            "vector_norm",
-            # "vector_cv",
-            # "vector_z_score",
+            # "attn_score",
+            # "vector_norm",
+            "vector_cv",
+            "vector_z_score",
             # "token_profiling",
-            # "convolution",
+            "convolution",
             # "normalized_pos",
         ],
         choices=[
@@ -256,7 +255,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--train_ratio",
         type=int,
-        default=0.7,
+        default=0.9,
         help="Train ratio for training.",
     )
 
@@ -278,14 +277,14 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=5,  # TODO: 8 or 16
+        default=8,  # or 16
         help="Number of gradient accumulation steps.",
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,  # TODO: higher
+        default=20,
         help="Number of training epochs.",
     )
 
@@ -299,7 +298,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=1024,
+        default=2048,
         help="Maximum sequence length for training.",
     )
 
@@ -313,7 +312,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=1000,  # TODO: 95 % train, 5% val and whole dataset
+        default=-1,
         help="Number of examples to sample for evaluation. Defaults to -1, which uses the full dataset.",
     )
 
@@ -340,8 +339,8 @@ def add_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--evaluate",
-        type=bool,
         default=False,
+        action="store_true",
         help="If set to true, the evaluation script is called and result artifacts are saved in the same wandb run.",
     )
 
@@ -405,6 +404,7 @@ def main(args: argparse.Namespace) -> None:
         project=wandb_project,
         entity=wandb_entity,
         config=vars(args),
+        group="training lightweight",
     )
     registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
 
@@ -476,6 +476,13 @@ def main(args: argparse.Namespace) -> None:
         else:
             param.requires_grad = False
 
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    num_total_params = sum(p.numel() for p in model.parameters())
+    num_frozen_params = num_total_params - num_trainable_params
+
+    trainable_perc_total = num_trainable_params / num_total_params
+    trainable_perc_model = num_trainable_params / num_frozen_params
+
     # Optimizer
     optimizer = AdamW(model.get_lightweight_params(), lr=args.learning_rate)
     loss = nn.CrossEntropyLoss(
@@ -487,6 +494,10 @@ def main(args: argparse.Namespace) -> None:
     print("Starting training...")
     model.train()
     model.set_train_mode(True)
+
+    best_val_loss = float("inf")
+    best_epoch = 0
+    accumulated_loss = 0
 
     for epoch in range(args.epochs):
         total_loss = 0
@@ -528,6 +539,7 @@ def main(args: argparse.Namespace) -> None:
             loss_epoch = loss_epoch / args.gradient_accumulation_steps
             loss_epoch.backward()
             total_loss += loss_epoch.item() * args.gradient_accumulation_steps
+            accumulated_loss += loss_epoch.item() * args.gradient_accumulation_steps
 
             # Update parameters every accumulation_steps mini-batches or at end of epoch
             if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(
@@ -535,12 +547,8 @@ def main(args: argparse.Namespace) -> None:
             ):
                 optimizer.step()
                 optimizer.zero_grad()
-                wandb.log(
-                    {
-                        "train_batch_loss": loss_epoch.item()
-                        * args.gradient_accumulation_steps
-                    }
-                )
+                wandb.log({"train_batch_loss_acc": accumulated_loss})
+                accumulated_loss = 0
             reset_caches(model)
 
         avg_train_loss = total_loss / len(train_loader)
@@ -582,44 +590,58 @@ def main(args: argparse.Namespace) -> None:
                     logits, labels
                 )  # validation loss computed based on the scaled tensors not the compressed sequence
                 total_val_loss += val_loss.item()
-                # wandb.log({"val_batch_loss": val_loss.item()})
+                accumulated_loss += val_loss.item()
+                if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(
+                    val_loader
+                ):
+                    wandb.log({"val_batch_loss_acc": accumulated_loss})
+                    accumulated_loss = 0
                 reset_caches(model)
 
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
         wandb.log({"epoch": epoch + 1, "val_loss": avg_val_loss})
 
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch
+            save_path, temp_dir = save_lightweight_temp(
+                model, cache_kwargs
+            )  # override weights each epoch for the best val loss
+            print(
+                f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {best_val_loss:.4f}"
+            )
+            parent_model_name = Path(checkpoint_path).parent.name
+            final = False
+
+            if epoch == args.epochs - 1:
+                # Save the final model to the model registry
+                final = True
+
         model.train()  # Switch back to training mode
         # model.set_train_mode(True)
-        save_path, temp_dir = save_lightweight_temp(
-            model, cache_kwargs
-        )  # override weights each epoch
-        print(f"Model saved temporarly to {save_path}")
 
-        parent_model_name = Path(checkpoint_path).parent.name
-        final = False
-
-        if epoch == args.epochs - 1:
-            # Save the final model to the model registry
-            final = True
-
-        artifact = wandb.Artifact(
-            name="lightweight_model",
-            type="model",
-            metadata={
-                "epoch": epoch + 1,
-                "date": timestamp,
-                "validation_loss": avg_val_loss,
-                "model_type": args.model_type,
-                "parent_model": parent_model_name,
-                "final": final,
-            },
-        )  # save one file per artifact
-        artifact.add_file(save_path)
-        run.link_artifact(
-            artifact=artifact,
-            target_path=registry_path,
-        )
+    artifact = wandb.Artifact(
+        name="lightweight_model",
+        type="model",
+        metadata={
+            "epoch": best_epoch + 1,
+            "date": timestamp,
+            "validation_loss": best_val_loss,
+            "model_type": args.model_type,
+            "parent_model": parent_model_name,
+            "final": final,
+            "trainable_params": num_trainable_params,
+            "total_params_model": num_frozen_params,
+            "trainable_perc_total": trainable_perc_total,
+            "trainable_perc_model": trainable_perc_model,
+        },
+    )  # save one file per artifact
+    artifact.add_file(save_path)
+    run.link_artifact(
+        artifact=artifact,
+        target_path=registry_path,
+    )
 
     wandb.finish()
 
@@ -630,7 +652,6 @@ def main(args: argparse.Namespace) -> None:
             "--tasks",
             "ultrachat",
             "--use_wandb",
-            "True",
             "--checkpoint_path",
             str(args.checkpoint_path),
             # "--compile",
@@ -642,13 +663,13 @@ def main(args: argparse.Namespace) -> None:
             "--prompt_compression_strategy",
             "lightweight",
             "--global_tokens",
-            args.global_tokens,
+            str(args.global_tokens),
             "--recent_window",
-            args.recent_window,
+            str(args.recent_window),
             "--model_type",
-            args.model_type,
+            str(args.model_type),
             "--vector_convolution",
-            args.vector_convolution,
+            str(args.vector_convolution),
             "--convolution_features",
             *args.convolution_features,
             "--feature_selection",

@@ -9,20 +9,20 @@ import time
 import argparse
 import math
 import json
-import pdb
-import regex as re
 import contextlib
-import shutil
-import itertools
-import pandas as pd
-import numpy as np
 from pathlib import Path
 from typing import Optional, List
 from collections import defaultdict, Counter
+import shutil
+import itertools
+import tempfile
+
+import regex as re
+import pandas as pd
+import numpy as np
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
 import wandb
-import tempfile
 
 import torch
 import torch._dynamo.config
@@ -32,7 +32,6 @@ from cache import (
     add_cache_arguments,
     cache_compatibility,
     get_cache_constructor,
-    load_trained_lightweight,
 )
 from model import Transformer, ModelArgs
 from generation_utils import (
@@ -389,18 +388,24 @@ def main(
             project=wandb_project,
             entity=wandb_entity,
             config=vars(args),
+            group="evaluation",
         )
         # registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
         # execute eval directly after training
-        if "lightweight" in cache_kwargs["cache_strategy"]:
-            artifact = wandb.use_artifact("lightweight_model:latest", type="model")
-            print("Artifact contents:", artifact.file())
+        if isinstance(cache_kwargs["cache_strategy"], str):
+            cache_strategy_list = [cache_kwargs["cache_strategy"]]
+        else:
+            cache_strategy_list = cache_kwargs["cache_strategy"]
+        if "lightweight" in cache_strategy_list:
+            model_artifact = wandb.use_artifact(
+                "lightweight_model:latest", type="model"
+            )
+            print("Artifact contents:", model_artifact.file())
             temp_dir_obj = (
                 tempfile.TemporaryDirectory()
             )  # Keep reference, don't use `with`
             temp_dir = temp_dir_obj.name  # Get the path
-            artifact.download(root=temp_dir)  # Download to a temp directory
-            print("Files in temp_dir:", os.listdir(temp_dir))
+            model_artifact.download(root=temp_dir)  # Download to a temp directory
             model_path = os.path.join(temp_dir, "model.pth")
             cache_kwargs["trained_weights"] = model_path
             print(f"Using lightweight model from {model_path}")
@@ -512,6 +517,9 @@ def main(
                     metadata={
                         "tasks": task_name,
                         "model_checkpoint": str(checkpoint_path),
+                        "features": model_artifact.metadata.get(
+                            "feature_selection", None
+                        ),
                     },
                 )
 
@@ -641,8 +649,8 @@ def add_eval_args(parser):
 
     parser.add_argument(
         "--use_wandb",
-        type=bool,
         default=False,
+        action="store_true",
         help="If weights and biases should be used during evaluation for loading the lightweight model or saving the eval results as artifacts.",
     )
 
