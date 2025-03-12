@@ -79,6 +79,17 @@ class PromptIterableDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.ignore_index = ignore_index
+        # Precompute valid dataset length
+        self.valid_length = sum(
+            1
+            for example in raw_dataset
+            if self.is_valid(self.tokenize_example(example))
+        )
+
+    def is_valid(self, tokenized_example):
+        """Check if the truncated example still contains assistant labels."""
+        labels = tokenized_example["labels"]
+        return (labels != self.ignore_index).any()
 
     def tokenize_example(self, example: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
@@ -137,6 +148,10 @@ class PromptIterableDataset(IterableDataset):
                 tokenized_example[k] = tokenized_example[k][
                     : -(old_len - self.max_seq_length)
                 ]
+            # Ensure there is at least some assistant text left
+            labels = tokenized_example["labels"]
+            if (labels != self.ignore_index).sum() == 0:
+                return None
         return tokenized_example
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -149,16 +164,17 @@ class PromptIterableDataset(IterableDataset):
         for example in self.raw_dataset:
             tokenized_example = self.tokenize_example(example)
             tokenized_example = self.truncate(tokenized_example)
-            yield tokenized_example
+            if tokenized_example is not None:  # ✅ Only yield valid examples
+                yield tokenized_example
 
     def __len__(self) -> int:
         """
         Returns the number of examples in the raw dataset.
 
         Returns:
-            int: The length of the raw dataset.
+            int: The length of the usable items based on max_seq_length.
         """
-        return len(self.raw_dataset)
+        return self.valid_length
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         """
@@ -215,7 +231,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         "--convolution_features",
         type=str,
         nargs="+",
-        default=["key", "value", "query", "embedding"],
+        default=["embedding"],
         choices=["key", "value", "query", "embedding"],
         help="Which features to compress using the convolutional layer.",
     )
@@ -225,13 +241,13 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         type=str,
         nargs="+",
         default=[
-            # "attn_score",
-            # "vector_norm",
-            "vector_cv",
-            "vector_z_score",
-            # "token_profiling",
-            "convolution",
-            # "normalized_pos",
+            "attn_score",
+            "vector_norm",
+            # "vector_cv",
+            # "vector_z_score",
+            "token_profiling",
+            # "convolution",
+            "normalized_pos",
         ],
         choices=[
             "attn_score",
@@ -284,7 +300,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20,
+        default=10,
         help="Number of training epochs.",
     )
 
@@ -618,30 +634,30 @@ def main(args: argparse.Namespace) -> None:
                 # Save the final model to the model registry
                 final = True
 
+            artifact = wandb.Artifact(
+                name="lightweight_model",
+                type="model",
+                metadata={
+                    "epoch": best_epoch + 1,
+                    "date": timestamp,
+                    "validation_loss": best_val_loss,
+                    "model_type": args.model_type,
+                    "parent_model": parent_model_name,
+                    "final": final,
+                    "trainable_params": num_trainable_params,
+                    "total_params_model": num_frozen_params,
+                    "trainable_perc_total": trainable_perc_total,
+                    "trainable_perc_model": trainable_perc_model,
+                },
+            )  # save one file per artifact
+            artifact.add_file(save_path)
+            run.link_artifact(
+                artifact=artifact,
+                target_path=registry_path,
+            )
+
         model.train()  # Switch back to training mode
         # model.set_train_mode(True)
-
-    artifact = wandb.Artifact(
-        name="lightweight_model",
-        type="model",
-        metadata={
-            "epoch": best_epoch + 1,
-            "date": timestamp,
-            "validation_loss": best_val_loss,
-            "model_type": args.model_type,
-            "parent_model": parent_model_name,
-            "final": final,
-            "trainable_params": num_trainable_params,
-            "total_params_model": num_frozen_params,
-            "trainable_perc_total": trainable_perc_total,
-            "trainable_perc_model": trainable_perc_model,
-        },
-    )  # save one file per artifact
-    artifact.add_file(save_path)
-    run.link_artifact(
-        artifact=artifact,
-        target_path=registry_path,
-    )
 
     wandb.finish()
 
