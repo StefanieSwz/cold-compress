@@ -240,13 +240,13 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         type=str,
         nargs="+",
         default=[
-            "attn_score",
-            "vector_norm",
-            # "vector_cv",
-            # "vector_z_score",
-            "token_profiling",
-            # "convolution",
-            "normalized_pos",
+            # "attn_score",
+            # "vector_norm",
+            # # "vector_cv",
+            # # "vector_z_score",
+            # "token_profiling",
+            "convolution",
+            # "normalized_pos",
         ],
         choices=[
             "attn_score",
@@ -566,7 +566,11 @@ def main(args: argparse.Namespace) -> None:
 
             # Normalize loss for gradient accumulation
             loss_epoch = loss_epoch / args.gradient_accumulation_steps
-            loss_epoch.backward()
+            if "convolution" in args.feature_selection:
+                retain_graph = True
+            else:
+                retain_graph = False
+            loss_epoch.backward(retain_graph=retain_graph)
             total_loss += loss_epoch.item() * args.gradient_accumulation_steps
             accumulated_loss += loss_epoch.item() * args.gradient_accumulation_steps
 

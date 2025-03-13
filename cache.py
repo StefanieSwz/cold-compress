@@ -1249,7 +1249,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
                     conv_buffer[
                         valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
-                    ] = conv_out.detach()
+                    ] = conv_out  # .clone() # TODO: Ask if clone() is necessary
 
         else:
             # Generation phase: update only the new token's key and value norms,
@@ -1367,7 +1367,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         vector_conv = vector_conv.view(batch_size, self.n_heads, -1)
                         # size (batch, n_heads, result feature dim)
                     conv_buffer[:, torch.arange(self.n_heads), idx, :] = (
-                        vector_conv.detach()
+                        vector_conv  # .clone() # TODO: Ask if clone() is necessary
                     )
 
     def _eviction_idx(self, input_pos):
