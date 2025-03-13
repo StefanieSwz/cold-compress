@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import signal
+import warnings
 import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
@@ -75,16 +76,19 @@ class PromptIterableDataset(IterableDataset):
             raw_dataset, "__len__"
         ), f"The dataset must have __len__ method. Dataset is {raw_dataset}"
 
-        self.raw_dataset = raw_dataset
+        # self.raw_dataset = raw_dataset
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.ignore_index = ignore_index
-        # Precompute valid dataset length
-        self.valid_length = sum(
-            1
-            for example in raw_dataset
-            if self.is_valid(self.tokenize_example(example))
-        )
+
+        self.valid_indices = [
+            idx
+            for idx in range(len(raw_dataset))
+            if self.is_valid(self.truncate(self.tokenize_example(raw_dataset[idx])))
+        ]
+
+        # Create valid dataset from valid indices
+        self.valid_dataset = [raw_dataset[idx] for idx in self.valid_indices]
 
     def is_valid(self, tokenized_example):
         """Check if the truncated example still contains assistant labels."""
@@ -148,10 +152,6 @@ class PromptIterableDataset(IterableDataset):
                 tokenized_example[k] = tokenized_example[k][
                     : -(old_len - self.max_seq_length)
                 ]
-            # Ensure there is at least some assistant text left
-            labels = tokenized_example["labels"]
-            if (labels != self.ignore_index).sum() == 0:
-                return None
         return tokenized_example
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -161,11 +161,10 @@ class PromptIterableDataset(IterableDataset):
         Yields:
             Iterator[Dict[str, torch.Tensor]]: An iterator over processed examples.
         """
-        for example in self.raw_dataset:
+        for example in self.valid_dataset:
             tokenized_example = self.tokenize_example(example)
             tokenized_example = self.truncate(tokenized_example)
-            if tokenized_example is not None:  # ✅ Only yield valid examples
-                yield tokenized_example
+            yield tokenized_example
 
     def __len__(self) -> int:
         """
@@ -174,7 +173,7 @@ class PromptIterableDataset(IterableDataset):
         Returns:
             int: The length of the usable items based on max_seq_length.
         """
-        return self.valid_length
+        return len(self.valid_dataset)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         """
@@ -192,10 +191,10 @@ class PromptIterableDataset(IterableDataset):
             Dict[str, torch.Tensor]: The tokenized and truncated example at the given index.
         """
         # Ensure the raw_dataset supports indexing
-        if not hasattr(self.raw_dataset, "__getitem__"):
+        if not hasattr(self.valid_dataset, "__getitem__"):
             raise TypeError("raw_dataset must support indexing to use __getitem__.")
 
-        example = self.raw_dataset[index]
+        example = self.valid_dataset[index]
         tokenized_example = self.tokenize_example(example)
         tokenized_example = self.truncate(tokenized_example)
         return tokenized_example
@@ -387,6 +386,16 @@ def prepare_dataset(
     train_dataset = PromptIterableDataset(train_samples, tokenizer, args.max_seq_length)
     val_dataset = PromptIterableDataset(val_samples, tokenizer, args.max_seq_length)
 
+    actual_train_len = len(train_dataset)
+    actual_val_len = len(val_dataset)
+    total_actual = actual_train_len + actual_val_len
+
+    if total_actual < args.num_samples:
+        warnings.warn(
+            f"⚠️ Expected {args.num_samples} samples, but filtering of invalid training examples due to shorter sequence length left only {total_actual}."
+            " Consider increasing `args.max_seq_length`."
+        )
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
@@ -496,8 +505,12 @@ def main(args: argparse.Namespace) -> None:
     num_total_params = sum(p.numel() for p in model.parameters())
     num_frozen_params = num_total_params - num_trainable_params
 
-    trainable_perc_total = num_trainable_params / num_total_params
-    trainable_perc_model = num_trainable_params / num_frozen_params
+    # trainable_perc_total = num_trainable_params / num_total_params
+    trainable_perc_model = float(num_trainable_params) / float(num_frozen_params)
+    print(
+        f"Percentage of trainable parameters in relation to model size: {trainable_perc_model:.2f}"
+    )
+    print(f"Total number of trainable parameters: {num_trainable_params:.2f}")
 
     # Optimizer
     optimizer = AdamW(model.get_lightweight_params(), lr=args.learning_rate)
@@ -578,7 +591,9 @@ def main(args: argparse.Namespace) -> None:
         # model.set_train_mode(False)
         total_val_loss = 0
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}"):
+            for i, batch in enumerate(
+                tqdm(val_loader, desc=f"Validation Epoch {epoch + 1}")
+            ):
                 # Move batch data to device
                 batch = {
                     key: value.to(device) if torch.is_tensor(value) else value
@@ -616,37 +631,38 @@ def main(args: argparse.Namespace) -> None:
 
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
-        wandb.log({"epoch": epoch + 1, "val_loss": avg_val_loss})
+        wandb.log({"val_loss": avg_val_loss})
 
-        if avg_val_loss < best_val_loss:
+        if avg_val_loss < best_val_loss or (epoch == args.epochs - 1):
             best_val_loss = avg_val_loss
-            best_epoch = epoch
             save_path, temp_dir = save_lightweight_temp(
                 model, cache_kwargs
             )  # override weights each epoch for the best val loss
-            print(
-                f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {best_val_loss:.4f}"
-            )
             parent_model_name = Path(checkpoint_path).parent.name
             final = False
 
             if epoch == args.epochs - 1:
                 # Save the final model to the model registry
                 final = True
+                print(
+                    f"✅ Final model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
+                )
+            else:
+                print(
+                    f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
+                )
 
             artifact = wandb.Artifact(
                 name="lightweight_model",
                 type="model",
                 metadata={
-                    "epoch": best_epoch + 1,
-                    "date": timestamp,
-                    "validation_loss": best_val_loss,
+                    "epoch": epoch + 1,
+                    "validation_loss": avg_val_loss,
                     "model_type": args.model_type,
                     "parent_model": parent_model_name,
                     "final": final,
                     "trainable_params": num_trainable_params,
                     "total_params_model": num_frozen_params,
-                    "trainable_perc_total": trainable_perc_total,
                     "trainable_perc_model": trainable_perc_model,
                 },
             )  # save one file per artifact
