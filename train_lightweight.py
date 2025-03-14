@@ -240,12 +240,12 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         type=str,
         nargs="+",
         default=[
-            # "attn_score",
-            # "vector_norm",
+            "attn_score",
+            "vector_norm",
             # # "vector_cv",
             # # "vector_z_score",
             # "token_profiling",
-            "convolution",
+            # "convolution",
             # "normalized_pos",
         ],
         choices=[
@@ -299,14 +299,14 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=5,
         help="Number of training epochs.",
     )
 
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-6,  # 1e-3 -- e-6 --> see which gives best convergence
+        default=3e-5,  # 1e-3 -- e-6 --> see which gives best convergence
         help="Learning rate for training.",
     )
 
@@ -327,7 +327,7 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=-1,
+        default=10000,
         help="Number of examples to sample for evaluation. Defaults to -1, which uses the full dataset.",
     )
 
@@ -494,7 +494,7 @@ def main(args: argparse.Namespace) -> None:
 
     train_loader, val_loader = prepare_dataset(tokenizer, args)
 
-    # TODO: count trainable parameters --> less then 10 %
+    # count trainable parameters --> less then 10 %
     for name, param in model.named_parameters():
         if "attention.kv_cache" in name:
             param.requires_grad = True
@@ -508,7 +508,7 @@ def main(args: argparse.Namespace) -> None:
     # trainable_perc_total = num_trainable_params / num_total_params
     trainable_perc_model = float(num_trainable_params) / float(num_frozen_params)
     print(
-        f"Percentage of trainable parameters in relation to model size: {trainable_perc_model:.2f}"
+        f"Percentage of trainable parameters in relation to model size: {trainable_perc_model:.6f}"
     )
     print(f"Total number of trainable parameters: {num_trainable_params:.2f}")
 
@@ -556,7 +556,7 @@ def main(args: argparse.Namespace) -> None:
             )
 
             # Forward pass
-            # torch.autograd.set_detect_anomaly(True)
+            torch.autograd.set_detect_anomaly(True)
             logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
 
             # Reshape logits and labels for loss computation
@@ -566,11 +566,7 @@ def main(args: argparse.Namespace) -> None:
 
             # Normalize loss for gradient accumulation
             loss_epoch = loss_epoch / args.gradient_accumulation_steps
-            if "convolution" in args.feature_selection:
-                retain_graph = True
-            else:
-                retain_graph = False
-            loss_epoch.backward(retain_graph=retain_graph)
+            loss_epoch.backward()
             total_loss += loss_epoch.item() * args.gradient_accumulation_steps
             accumulated_loss += loss_epoch.item() * args.gradient_accumulation_steps
 

@@ -908,6 +908,8 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         for attr_name in attrs_to_zero:
             if hasattr(self, attr_name):
                 getattr(self, attr_name).zero_()
+                tensor = getattr(self, attr_name)
+                setattr(self, attr_name, tensor.detach())
 
     def return_attn(self) -> bool:
         """
@@ -1199,18 +1201,23 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 self.token_special_profiling = token_special_profiling.detach()
                 self.token_punctuation_profiling = token_punctuation_profiling.detach()
             if "convolution" in self.feature_selection:
-                feature_dict = {
-                    "embedding": x_filtered.detach(),
-                    "query": q_filtered.detach(),
-                    "key": k_val.detach(),
-                    "value": v_val.detach(),
-                }
-                valid_mask = self.pos != -1  # shape: [B, H, M]
-                # Find indices of valid slots.
-                valid_idx = torch.nonzero(valid_mask)  # shape: [N_valid, 3]
+                with torch.no_grad():
+                    feature_dict = {
+                        "embedding": x_filtered,
+                        "query": q_filtered,
+                        "key": k_val,
+                        "value": v_val,
+                    }
+                    valid_mask = (self.pos != -1).clone().detach()  # shape: [B, H, M]
+                    # Find indices of valid slots.
+                    valid_idx = torch.nonzero(
+                        valid_mask
+                    )  # shape: [N_valid, 3], where 3 is [batch_idx, head_idx, cache_slot_idx]
                 for feat in self.convolution_features:
                     # Get the filtered tensor for this feature.
-                    feat_tensor = feature_dict[feat]  # shape: [B, H, M, D]
+                    feat_tensor = (
+                        feature_dict[feat].clone().detach()
+                    )  # shape: [B, H, M, D]
 
                     # Gather only valid vectors using the valid indices.
                     # valid_idx has columns: [batch_idx, head_idx, cache_slot_idx].
@@ -1249,7 +1256,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
 
                     conv_buffer[
                         valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
-                    ] = conv_out  # .clone() # TODO: Ask if clone() is necessary
+                    ] = conv_out  # dont detach here as convolution must be trained
 
         else:
             # Generation phase: update only the new token's key and value norms,
@@ -1350,7 +1357,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 }
                 for feat in self.convolution_features:
                     # Get the filtered tensor for this feature.
-                    feat_tensor = feature_dict[feat]
+                    feat_tensor = feature_dict[feat].clone().detach()
                     # Get the convolution layer for this feature.
                     conv_block = self.conv_layers[feat]
                     # Get the buffer for this feature.
@@ -1366,9 +1373,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         )
                         vector_conv = vector_conv.view(batch_size, self.n_heads, -1)
                         # size (batch, n_heads, result feature dim)
-                    conv_buffer[:, torch.arange(self.n_heads), idx, :] = (
-                        vector_conv  # .clone() # TODO: Ask if clone() is necessary
-                    )
+                    conv_buffer[:, torch.arange(self.n_heads), idx, :] = vector_conv
 
     def _eviction_idx(self, input_pos):
         scores = self._token_importances(input_pos)

@@ -137,6 +137,24 @@ transformer_configs = {
             "rope_type": "llama3",
         },
     ),
+    "Llama-3.2-3B-Instruct": dict(
+        block_size=131072,  # max_position_embeddings
+        n_layer=28,  # num_hidden_layers
+        n_head=24,  # num_attention_heads
+        n_local_heads=8,  # num_key_value_heads
+        dim=3072,  # hidden_size
+        intermediate_size=8192,  # intermediate_size
+        vocab_size=128256,  # vocab_size
+        rope_base=500000,  # rope_theta
+        max_length=131072,  # max_position_embeddings
+        rope_scaling={
+            "factor": 32.0,  # rope_scaling.factor
+            "low_freq_factor": 1.0,  # rope_scaling.low_freq_factor
+            "high_freq_factor": 4.0,  # rope_scaling.high_freq_factor
+            "original_max_position_embeddings": 8192,  # rope_scaling.original_max_position_embeddings
+            "rope_type": "llama3",  # rope_scaling.rope_type
+        },
+    ),
     "Qwen2-1.5B-Instruct": dict(
         block_size=32768,
         n_layer=28,
