@@ -588,7 +588,7 @@ def main(args: argparse.Namespace) -> None:
             )
 
             # Forward pass
-            torch.autograd.set_detect_anomaly(True)
+            # torch.autograd.set_detect_anomaly(True)
             logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
 
             # Reshape logits and labels for loss computation
@@ -599,8 +599,10 @@ def main(args: argparse.Namespace) -> None:
             # Normalize loss for gradient accumulation
             loss_epoch = loss_epoch / args.gradient_accumulation_steps
             loss_epoch.backward()
-            total_loss += loss_epoch.item() * args.gradient_accumulation_steps
-            accumulated_loss += loss_epoch.item() * args.gradient_accumulation_steps
+            total_loss += loss_epoch.detach().item() * args.gradient_accumulation_steps
+            accumulated_loss += (
+                loss_epoch.detach().item() * args.gradient_accumulation_steps
+            )
 
             # Update parameters every accumulation_steps mini-batches or at end of epoch
             if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(

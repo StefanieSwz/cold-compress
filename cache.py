@@ -1,15 +1,13 @@
 import math
-import operator
-import tempfile
+import gc
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 import argparse
 from abc import ABC, abstractmethod
 from collections import Counter
 import regex as re
 import torch
 import torch.nn as nn
-import wandb
 
 from prompt_compression import get_prompt_compressor_constructor
 from cache_utils import get_convolution_params
@@ -1106,113 +1104,116 @@ class KVCacheLightweight(KVCacheHeadSpecific):
             attn (torch.Tensor): Attention scores with shape [batch_size, n_heads, seq_len, seq_len].
             **kwargs: Additional keyword arguments.
         """
-        x = kwargs[
-            "x"
-        ]  # x.shape = [batch_size, sequence_length, model_hidden_dim = n_query_heads * head_dim]
-        q = kwargs[
-            "query"
-        ]  # q.shape = [batch_size, n_query_heads, sequence_length, head dim]
-        batch_size, n_query_heads, seq_len, head_dim = q.shape
-        # seq_len is 1 for not prefill, and complete sequence length for prefill, that can be larger then max_cache_length
-        group_size = n_query_heads // self.n_heads
-        q_grouped = q.view(batch_size, self.n_heads, group_size, seq_len, head_dim)
-        q_avg = q_grouped.mean(dim=2)  # [batch_size, n_heads, seq_len, head_dim]
-        max_cache_len = self.pos.shape[2]
+        with torch.no_grad():
+            x = kwargs[
+                "x"
+            ]  # x.shape = [batch_size, sequence_length, model_hidden_dim = n_query_heads * head_dim]
+            q = kwargs[
+                "query"
+            ]  # q.shape = [batch_size, n_query_heads, sequence_length, head dim]
+            batch_size, n_query_heads, seq_len, head_dim = q.shape
+            # seq_len is 1 for not prefill, and complete sequence length for prefill, that can be larger then max_cache_length
+            group_size = n_query_heads // self.n_heads
+            q_grouped = q.view(batch_size, self.n_heads, group_size, seq_len, head_dim)
+            q_avg = q_grouped.mean(dim=2)  # [batch_size, n_heads, seq_len, head_dim]
+            max_cache_len = self.pos.shape[2]
         if is_prefill:
-            x_filtered = self.filter_embedding(x)
-            # shape = [batch_size, n_heads, max_cache_length, model_hidden_dim = n_query_heads * head_dim]
-            q_filtered = self.filter_query(q_avg)
-            # shape = [batch_size, n_heads, max_cache_length, head_dim]
-            if "vector_norm" in self.feature_selection:
-                # Calculate norms over the head dimension.
-                # key and value already filtered by prompt compressor
-                key_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
-                    k_val, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len/prompt_len]
-                value_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
-                    v_val, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len/prompt_len]
-                query_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
-                    q_filtered, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len]
-                embedding_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
-                    x_filtered, ord=2, dim=-1
-                )  # [batch_size, n_heads, max_cache_len]
-                if seq_len < max_cache_len:
-                    self.key_norm[:, :, :seq_len] = key_norm.detach()
-                    self.value_norm[:, :, :seq_len] = value_norm.detach()
-                    self.query_norm = query_norm.detach()
-                    self.embedding_norm = embedding_norm.detach()
-                else:
-                    self.key_norm = key_norm.detach()
-                    self.value_norm = value_norm.detach()
-                    self.query_norm = query_norm.detach()
-                    self.embedding_norm = embedding_norm.detach()
-            if "vector_cv" in self.feature_selection:
-                key_cv = self.compute_cv(k_val)
-                value_cv = self.compute_cv(v_val)
-                query_cv = self.compute_cv(q_filtered)
-                embedding_cv = self.compute_cv(x_filtered)
-                if seq_len < max_cache_len:
-                    self.key_cv[:, :, :seq_len] = key_cv.detach()
-                    self.value_cv[:, :, :seq_len] = value_cv.detach()
-                    self.query_cv = query_cv.detach()
-                    self.embedding_cv = embedding_cv.detach()
-                else:
-                    self.key_cv = key_cv.detach()
-                    self.value_cv = value_cv.detach()
-                    self.query_cv = query_cv.detach()
-                    self.embedding_cv = embedding_cv.detach()
-            if "vector_z_score" in self.feature_selection:
-                key_z = self.compute_z_score(k_val)
-                value_z = self.compute_z_score(v_val)
-                query_z = self.compute_z_score(q_filtered)
-                embedding_z = self.compute_z_score(x_filtered)
-                if seq_len < max_cache_len:
-                    self.key_z[:, :, :seq_len] = key_z.detach()
-                    self.value_z[:, :, :seq_len] = value_z.detach()
-                    self.query_z = query_z.detach()
-                    self.embedding_z = embedding_z.detach()
-                else:
-                    self.key_z = key_z.detach()
-                    self.value_z = value_z.detach()
-                    self.query_z = query_z.detach()
-                    self.embedding_z = embedding_z.detach()
-            if "attn_score" in self.feature_selection:
-                if attn.ndim == 4:
+            with torch.no_grad():
+                x_filtered = self.filter_embedding(x)
+                # shape = [batch_size, n_heads, max_cache_length, model_hidden_dim = n_query_heads * head_dim]
+                q_filtered = self.filter_query(q_avg)
+                # shape = [batch_size, n_heads, max_cache_length, head_dim]
+                if "vector_norm" in self.feature_selection:
+                    # Calculate norms over the head dimension.
+                    # key and value already filtered by prompt compressor
+                    key_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        k_val, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len/prompt_len]
+                    value_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        v_val, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len/prompt_len]
+                    query_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        q_filtered, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len]
+                    embedding_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        x_filtered, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len]
+                    if seq_len < max_cache_len:
+                        self.key_norm[:, :, :seq_len] = key_norm.detach()
+                        self.value_norm[:, :, :seq_len] = value_norm.detach()
+                        self.query_norm = query_norm.detach()
+                        self.embedding_norm = embedding_norm.detach()
+                    else:
+                        self.key_norm = key_norm.detach()
+                        self.value_norm = value_norm.detach()
+                        self.query_norm = query_norm.detach()
+                        self.embedding_norm = embedding_norm.detach()
+                if "vector_cv" in self.feature_selection:
+                    key_cv = self.compute_cv(k_val)
+                    value_cv = self.compute_cv(v_val)
+                    query_cv = self.compute_cv(q_filtered)
+                    embedding_cv = self.compute_cv(x_filtered)
+                    if seq_len < max_cache_len:
+                        self.key_cv[:, :, :seq_len] = key_cv.detach()
+                        self.value_cv[:, :, :seq_len] = value_cv.detach()
+                        self.query_cv = query_cv.detach()
+                        self.embedding_cv = embedding_cv.detach()
+                    else:
+                        self.key_cv = key_cv.detach()
+                        self.value_cv = value_cv.detach()
+                        self.query_cv = query_cv.detach()
+                        self.embedding_cv = embedding_cv.detach()
+                if "vector_z_score" in self.feature_selection:
+                    key_z = self.compute_z_score(k_val)
+                    value_z = self.compute_z_score(v_val)
+                    query_z = self.compute_z_score(q_filtered)
+                    embedding_z = self.compute_z_score(x_filtered)
+                    if seq_len < max_cache_len:
+                        self.key_z[:, :, :seq_len] = key_z.detach()
+                        self.value_z[:, :, :seq_len] = value_z.detach()
+                        self.query_z = query_z.detach()
+                        self.embedding_z = embedding_z.detach()
+                    else:
+                        self.key_z = key_z.detach()
+                        self.value_z = value_z.detach()
+                        self.query_z = query_z.detach()
+                        self.embedding_z = embedding_z.detach()
+                if "attn_score" in self.feature_selection:
+                    if attn.ndim == 4:
+                        seq_len_actual = attn.shape[-1]
+                        attn = attn.squeeze(0).sum(dim=1) / (seq_len_actual - input_pos)
+                    attn = attn.view(
+                        1, self.n_heads, -1
+                    )  # [batch_size, n_heads, prompt_len]
+                    # can handle both cases, already compressed version from prompt compressor or if prompt_len < cache-len
                     seq_len_actual = attn.shape[-1]
-                    attn = attn.squeeze(0).sum(dim=1) / (seq_len_actual - input_pos)
-                attn = attn.view(
-                    1, self.n_heads, -1
-                )  # [batch_size, n_heads, prompt_len]
-                # can handle both cases, already compressed version from prompt compressor or if prompt_len < cache-len
-                seq_len_actual = attn.shape[-1]
-                self.attn_score[:, :, :seq_len_actual] = attn.detach()
-            if "token_profiling" in self.feature_selection:
-                # Token profiling features
-                # input_ids: shape (batch, seq_len)
-                token_special_profiling = self.build_ids_mask(
-                    kwargs["input_ids"], self.special_ids
-                )
-                token_punctuation_profiling = self.build_ids_mask(
-                    kwargs["input_ids"], self.punctuation_ids
-                )
-                # shape (batch, n_heads, max_cache_len)
-                self.token_special_profiling = token_special_profiling.detach()
-                self.token_punctuation_profiling = token_punctuation_profiling.detach()
+                    self.attn_score[:, :, :seq_len_actual] = attn.detach()
+                if "token_profiling" in self.feature_selection:
+                    # Token profiling features
+                    # input_ids: shape (batch, seq_len)
+                    token_special_profiling = self.build_ids_mask(
+                        kwargs["input_ids"], self.special_ids
+                    )
+                    token_punctuation_profiling = self.build_ids_mask(
+                        kwargs["input_ids"], self.punctuation_ids
+                    )
+                    # shape (batch, n_heads, max_cache_len)
+                    self.token_special_profiling = token_special_profiling.detach()
+                    self.token_punctuation_profiling = (
+                        token_punctuation_profiling.detach()
+                    )
             if "convolution" in self.feature_selection:
-                with torch.no_grad():
-                    feature_dict = {
-                        "embedding": x_filtered,
-                        "query": q_filtered,
-                        "key": k_val,
-                        "value": v_val,
-                    }
-                    valid_mask = (self.pos != -1).clone().detach()  # shape: [B, H, M]
-                    # Find indices of valid slots.
-                    valid_idx = torch.nonzero(
-                        valid_mask
-                    )  # shape: [N_valid, 3], where 3 is [batch_idx, head_idx, cache_slot_idx]
+                feature_dict = {
+                    "embedding": x_filtered,
+                    "query": q_filtered,
+                    "key": k_val,
+                    "value": v_val,
+                }
+                valid_mask = (self.pos != -1).clone().detach()  # shape: [B, H, M]
+                # Find indices of valid slots.
+                valid_idx = torch.nonzero(
+                    valid_mask
+                )  # shape: [N_valid, 3], where 3 is [batch_idx, head_idx, cache_slot_idx]
                 for feat in self.convolution_features:
                     # Get the filtered tensor for this feature.
                     feat_tensor = (
@@ -1261,6 +1262,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         else:
             # Generation phase: update only the new token's key and value norms,
             # and update full attention scores.
+            # not used for training, only for generation
             idx = torch.where(self.pos == input_pos)[
                 2
             ]  # Find cache index per head for current input_pos
