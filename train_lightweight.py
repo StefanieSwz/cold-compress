@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import signal
+import psutil
 import warnings
 import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
@@ -402,6 +403,37 @@ def prepare_dataset(
     return train_loader, val_loader
 
 
+def log_system_metrics():
+    """Logs CPU, system memory, and process memory usage to W&B."""
+
+    # Get overall system CPU & Memory usage
+    cpu_usage = psutil.cpu_percent(interval=1)  # CPU utilization (%)
+    cpu_memory = psutil.virtual_memory().used / 1e9  # Total CPU RAM used (GB)
+    cpu_available = psutil.virtual_memory().available / 1e9  # Available CPU RAM (GB)
+    system_load = psutil.getloadavg()[0]  # 1-minute system load
+
+    # Get process-specific memory usage
+    process = psutil.Process(os.getpid())  # Get the current process
+    process_memory = (
+        process.memory_info().rss / 1e9
+    )  # Resident Set Size (RAM used by this process, in GB)
+    process_vmemory = (
+        process.memory_info().vms / 1e9
+    )  # Virtual Memory Size (Total allocated memory, in GB)
+
+    # Log to W&B
+    wandb.log(
+        {
+            "CPU Usage (%)": cpu_usage,
+            "CPU Memory Used (GB)": cpu_memory,
+            "CPU Memory Available (GB)": cpu_available,
+            "System Load (1min avg)": system_load,
+            "Process RAM Used (GB)": process_memory,  # Actual memory occupied by the process
+            "Process Virtual Memory (GB)": process_vmemory,  # Total virtual memory allocated
+        }
+    )
+
+
 def main(args: argparse.Namespace) -> None:
     checkpoint_path = args.checkpoint_path
 
@@ -578,6 +610,7 @@ def main(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
                 wandb.log({"train_batch_loss_acc": accumulated_loss})
                 accumulated_loss = 0
+            log_system_metrics()
             reset_caches(model)
 
         avg_train_loss = total_loss / len(train_loader)
