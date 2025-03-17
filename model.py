@@ -483,24 +483,30 @@ class Attention(nn.Module):
                 return_attn=self.kv_cache.return_attn(),
             )
 
-        if (
-            attn is not None
-        ):  # Mean pool over the grouped queries (average over self.n_head // self.n_local_heads)
-            attn = attn.view(
-                bsz, self.n_local_heads, self.n_head // self.n_local_heads, seqlen, -1
-            ).mean(dim=2)
+            if (
+                attn is not None
+            ):  # Mean pool over the grouped queries (average over self.n_head // self.n_local_heads)
+                attn = attn.view(
+                    bsz,
+                    self.n_local_heads,
+                    self.n_head // self.n_local_heads,
+                    seqlen,
+                    -1,
+                ).mean(dim=2)
 
         # Prefill updates happen after since we don't use the KV cache for prefill attention
         if is_prefill:
-            if isinstance(self.kv_cache, KVCacheLightweight):
-                cache_kwargs["feature_selection"] = self.kv_cache.feature_selection
-                cache_kwargs["convolution_features"] = (
-                    self.kv_cache.convolution_features
-                )
+            with torch.no_grad():
+                if isinstance(self.kv_cache, KVCacheLightweight):
+                    cache_kwargs["feature_selection"] = self.kv_cache.feature_selection
+                    cache_kwargs["convolution_features"] = (
+                        self.kv_cache.convolution_features
+                    )
             input_pos, k, v, attn = self.compress_prompt(
                 input_pos, k, v, attn, **cache_kwargs
             )
-            self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
+            with torch.no_grad():
+                self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
 
         # [Optional] Update the KV Cache internal state now that we have attention probabilities
         # This is a no-op for most cache classes

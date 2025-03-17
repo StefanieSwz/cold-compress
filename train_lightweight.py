@@ -3,15 +3,15 @@ import sys
 import time
 import argparse
 import signal
-import psutil
+import gc
 import warnings
 import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
+from tqdm import tqdm
+import psutil
 import numpy as np
 from dotenv import load_dotenv
-import wandb
-from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -20,6 +20,8 @@ import torch._dynamo.config
 import torch._inductor.config
 from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
+import wandb
+import tracemalloc
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
 from cache_utils import save_lightweight_temp
@@ -426,8 +428,8 @@ def log_system_metrics():
         {
             "CPU Usage (%)": cpu_usage,
             "CPU Memory Used (GB)": cpu_memory,
-            "CPU Memory Available (GB)": cpu_available,
-            "System Load (1min avg)": system_load,
+            # "CPU Memory Available (GB)": cpu_available,
+            # "System Load (1min avg)": system_load,
             "Process RAM Used (GB)": process_memory,  # Actual memory occupied by the process
             "Process Virtual Memory (GB)": process_vmemory,  # Total virtual memory allocated
         }
@@ -559,6 +561,8 @@ def main(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     best_epoch = 0
     accumulated_loss = 0
+    tracemalloc.start()
+    snapshot_prev = tracemalloc.take_snapshot()
 
     for epoch in range(args.epochs):
         total_loss = 0
@@ -612,8 +616,15 @@ def main(args: argparse.Namespace) -> None:
                 optimizer.zero_grad()
                 wandb.log({"train_batch_loss_acc": accumulated_loss})
                 accumulated_loss = 0
-            log_system_metrics()
+
+            del logits, labels, loss_epoch
             reset_caches(model)
+            if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(
+                train_loader
+            ):
+                torch.cuda.empty_cache()
+                gc.collect()
+                log_system_metrics()
 
         avg_train_loss = total_loss / len(train_loader)
         print(

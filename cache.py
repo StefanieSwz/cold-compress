@@ -281,11 +281,23 @@ class KVCache(ABC, nn.Module):
 
         NB: For more performance, don't reset k_cache and v_cache since we overwrite them in update.
         """
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-        self.mask.zero_()
-        self.cache_cts.zero_()
+        attrs_to_zero = [
+            "k_cache",
+            "v_cache",
+            "mask",
+            "cache_cts",
+        ]
+
+        for attr_name in attrs_to_zero:
+            if hasattr(self, attr_name):
+                getattr(self, attr_name).zero_()
+                tensor = getattr(self, attr_name)
+                setattr(self, attr_name, tensor.detach())
+                del tensor
+
         self.pos.fill_(-1)
+        tensor = self.pos
+        self.pos = tensor.detach()
 
     def return_attn(self):
         """
@@ -908,6 +920,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 getattr(self, attr_name).zero_()
                 tensor = getattr(self, attr_name)
                 setattr(self, attr_name, tensor.detach())
+                del tensor
 
     def return_attn(self) -> bool:
         """
