@@ -4,6 +4,7 @@ import time
 import argparse
 import signal
 import gc
+import pdb
 import warnings
 import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
@@ -411,17 +412,15 @@ def log_system_metrics():
     # Get overall system CPU & Memory usage
     cpu_usage = psutil.cpu_percent(interval=1)  # CPU utilization (%)
     cpu_memory = psutil.virtual_memory().used / 1e9  # Total CPU RAM used (GB)
-    cpu_available = psutil.virtual_memory().available / 1e9  # Available CPU RAM (GB)
-    system_load = psutil.getloadavg()[0]  # 1-minute system load
 
     # Get process-specific memory usage
     process = psutil.Process(os.getpid())  # Get the current process
-    process_memory = (
-        process.memory_info().rss / 1e9
-    )  # Resident Set Size (RAM used by this process, in GB)
-    process_vmemory = (
-        process.memory_info().vms / 1e9
-    )  # Virtual Memory Size (Total allocated memory, in GB)
+    # process_memory = (
+    #     process.memory_info().rss / 1e9
+    # )  # Resident Set Size (RAM used by this process, in GB)
+    # process_vmemory = (
+    #     process.memory_info().vms / 1e9
+    # )  # Virtual Memory Size (Total allocated memory, in GB)
 
     # Log to W&B
     wandb.log(
@@ -430,8 +429,8 @@ def log_system_metrics():
             "CPU Memory Used (GB)": cpu_memory,
             # "CPU Memory Available (GB)": cpu_available,
             # "System Load (1min avg)": system_load,
-            "Process RAM Used (GB)": process_memory,  # Actual memory occupied by the process
-            "Process Virtual Memory (GB)": process_vmemory,  # Total virtual memory allocated
+            # "Process RAM Used (GB)": process_memory,  # Actual memory occupied by the process
+            # "Process Virtual Memory (GB)": process_vmemory,  # Total virtual memory allocated
         }
     )
 
@@ -619,9 +618,7 @@ def main(args: argparse.Namespace) -> None:
 
             del logits, labels, loss_epoch
             reset_caches(model)
-            if (i + 1) % args.gradient_accumulation_steps == 0 or (i + 1) == len(
-                train_loader
-            ):
+            if (i + 1) % 100 == 0 or (i + 1) == len(train_loader):
                 torch.cuda.empty_cache()
                 gc.collect()
                 log_system_metrics()
