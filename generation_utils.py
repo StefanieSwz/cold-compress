@@ -137,7 +137,7 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 def greedy(logits, next_token):
     probs = torch.nn.functional.softmax(logits[0, -1], dim=-1)
     if next_token is None:
-        idx_next = torch.argmax(probs.clone(), keepdim=True).to(dtype=torch.int)
+        idx_next = torch.argmax(probs, keepdim=True).to(dtype=torch.int)
     else:
         idx_next = next_token
     return idx_next, probs
@@ -598,14 +598,14 @@ def compile_funcs(compile=True):
         global decode_one_token, prefill
         decode_one_token = torch.compile(
             decode_one_token,
-            fullgraph=False,
+            fullgraph=True,
             # dynamic=True,
             mode="reduce-overhead",
             # options={"trace.graph_diagram": True, "trace.enabled": True}
         )
         prefill = torch.compile(
             prefill,
-            fullgraph=False,
+            fullgraph=True,
             dynamic=True,
             # options={"trace.graph_diagram": True, "trace.enabled": True}
         )

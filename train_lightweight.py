@@ -676,47 +676,79 @@ def main(args: argparse.Namespace) -> None:
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss})
 
-        if avg_val_loss < best_val_loss or (epoch == args.epochs - 1):
-            best_val_loss = avg_val_loss
-            save_path, temp_dir = save_lightweight_temp(
-                model, cache_kwargs
-            )  # override weights each epoch for the best val loss
-            parent_model_name = Path(checkpoint_path).parent.name
-            final = False
+        # if avg_val_loss < best_val_loss or (epoch == args.epochs - 1):
+        #     best_val_loss = avg_val_loss
+        #     save_path, temp_dir = save_lightweight_temp(
+        #         model, cache_kwargs
+        #     )  # override weights each epoch for the best val loss
+        #     parent_model_name = Path(checkpoint_path).parent.name
+        #     final = False
 
-            if epoch == args.epochs - 1:
-                # Save the final model to the model registry
-                final = True
-                print(
-                    f"✅ Final model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
-                )
-            else:
-                print(
-                    f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
-                )
+        #     if epoch == args.epochs - 1:
+        #         # Save the final model to the model registry
+        #         final = True
+        #         print(
+        #             f"✅ Final model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
+        #         )
+        #     else:
+        #         print(
+        #             f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
+        #         )
 
-            artifact = wandb.Artifact(
-                name="lightweight_model",
-                type="model",
-                metadata={
-                    "epoch": epoch + 1,
-                    "validation_loss": avg_val_loss,
-                    "model_type": args.model_type,
-                    "parent_model": parent_model_name,
-                    "final": final,
-                    "trainable_params": num_trainable_params,
-                    "total_params_model": num_frozen_params,
-                    "trainable_perc_model": trainable_perc_model,
-                },
-            )  # save one file per artifact
-            artifact.add_file(save_path)
-            run.link_artifact(
-                artifact=artifact,
-                target_path=registry_path,
-            )
+        #     artifact = wandb.Artifact(
+        #         name="lightweight_model",
+        #         type="model",
+        #         metadata={
+        #             "epoch": epoch + 1,
+        #             "validation_loss": avg_val_loss,
+        #             "model_type": args.model_type,
+        #             "parent_model": parent_model_name,
+        #             "final": final,
+        #             "trainable_params": num_trainable_params,
+        #             "total_params_model": num_frozen_params,
+        #             "trainable_perc_model": trainable_perc_model,
+        #         },
+        #     )  # save one file per artifact
+        #     artifact.add_file(save_path)
+        #     run.link_artifact(
+        #         artifact=artifact,
+        #         target_path=registry_path,
+        #     )
 
         model.train()  # Switch back to training mode
         # model.set_train_mode(True)
+
+    save_path, temp_dir = save_lightweight_temp(
+        model, cache_kwargs
+    )  # override weights each epoch for the best val loss
+    parent_model_name = Path(checkpoint_path).parent.name
+
+    final = True
+    print(
+        f"✅ Final model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
+    )
+
+    artifact = wandb.Artifact(
+        name="lightweight_model",
+        type="model",
+        metadata={
+            "epoch": epoch + 1,
+            "validation_loss": avg_val_loss,
+            "model_type": args.model_type,
+            "parent_model": parent_model_name,
+            "final": final,
+            "trainable_params": num_trainable_params,
+            "total_params_model": num_frozen_params,
+            "trainable_perc_model": trainable_perc_model,
+        },
+    )  # save one file per artifact
+    artifact.add_file(save_path)
+    artifact_ref = run.log_artifact(artifact)
+    print("Artifact reference:", artifact_ref.version)
+    run.link_artifact(
+        artifact=artifact,
+        target_path=registry_path,
+    )
 
     wandb.finish()
 
@@ -751,6 +783,8 @@ def main(args: argparse.Namespace) -> None:
             *args.feature_selection,
             "--trained_weights",
             "none",
+            "--lightweight_model_version",
+            str(artifact_ref.version),
         ]
         print(f"Executing evaluation script with arguments: {eval_command}")
         subprocess.run(eval_command)

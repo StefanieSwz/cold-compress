@@ -397,9 +397,8 @@ def main(
         else:
             cache_strategy_list = cache_kwargs["cache_strategy"]
         if "lightweight" in cache_strategy_list:
-            model_artifact = wandb.use_artifact(
-                "lightweight_model:latest", type="model"
-            )
+            model_ref = "lightweight_model:" + args.lightweight_model_version
+            model_artifact = wandb.use_artifact(model_ref, type="model")
             print("Artifact contents:", model_artifact.file())
             temp_dir_obj = (
                 tempfile.TemporaryDirectory()
@@ -652,6 +651,13 @@ def add_eval_args(parser):
         default=False,
         action="store_true",
         help="If weights and biases should be used during evaluation for loading the lightweight model or saving the eval results as artifacts.",
+    )
+
+    parser.add_argument(
+        "--lightweight_model_version",
+        type=str,
+        default="latest",
+        help="Version of the lightweight model to use.",
     )
 
 
