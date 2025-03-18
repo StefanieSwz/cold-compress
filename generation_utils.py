@@ -598,14 +598,14 @@ def compile_funcs(compile=True):
         global decode_one_token, prefill
         decode_one_token = torch.compile(
             decode_one_token,
-            fullgraph=True,
+            fullgraph=False,
             # dynamic=True,
             mode="reduce-overhead",
             # options={"trace.graph_diagram": True, "trace.enabled": True}
         )
         prefill = torch.compile(
             prefill,
-            fullgraph=True,
+            fullgraph=False,
             dynamic=True,
             # options={"trace.graph_diagram": True, "trace.enabled": True}
         )
