@@ -137,7 +137,7 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 def greedy(logits, next_token):
     probs = torch.nn.functional.softmax(logits[0, -1], dim=-1)
     if next_token is None:
-        idx_next = torch.argmax(probs, keepdim=True).to(dtype=torch.int)
+        idx_next = torch.argmax(probs.clone(), keepdim=True).to(dtype=torch.int)
     else:
         idx_next = next_token
     return idx_next, probs
