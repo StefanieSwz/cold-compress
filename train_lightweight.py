@@ -743,7 +743,7 @@ def main(args: argparse.Namespace) -> None:
         },
     )  # save one file per artifact
     artifact.add_file(save_path)
-    artifact_ref = run.log_artifact(artifact)
+    artifact_ref = run.log_artifact(artifact).wait()
     print("Artifact reference:", artifact_ref.version)
     run.link_artifact(
         artifact=artifact,
