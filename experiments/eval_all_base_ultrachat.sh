@@ -19,6 +19,5 @@ for MODEL in ${MODELS[@]}; do
 		--tasks $TASKS \
 		--cache_sizes $CACHE_SIZES \
 		--num_samples $NUM_SAMPLES \
-		--num_gpus 2 \
 		--add_full
 done
