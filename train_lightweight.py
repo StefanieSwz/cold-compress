@@ -4,7 +4,6 @@ import time
 import argparse
 import signal
 import gc
-import pdb
 import warnings
 import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
@@ -22,7 +21,6 @@ import torch._inductor.config
 from datasets import load_dataset
 from tp import maybe_init_dist, handle_sigint, handle_uncaught_exception
 import wandb
-import tracemalloc
 
 from tokenizer import get_tokenizer, TokenizersChatFormat
 from cache_utils import save_lightweight_temp
@@ -406,35 +404,6 @@ def prepare_dataset(
     return train_loader, val_loader
 
 
-def log_system_metrics():
-    """Logs CPU, system memory, and process memory usage to W&B."""
-
-    # Get overall system CPU & Memory usage
-    cpu_usage = psutil.cpu_percent(interval=1)  # CPU utilization (%)
-    cpu_memory = psutil.virtual_memory().used / 1e9  # Total CPU RAM used (GB)
-
-    # Get process-specific memory usage
-    process = psutil.Process(os.getpid())  # Get the current process
-    # process_memory = (
-    #     process.memory_info().rss / 1e9
-    # )  # Resident Set Size (RAM used by this process, in GB)
-    # process_vmemory = (
-    #     process.memory_info().vms / 1e9
-    # )  # Virtual Memory Size (Total allocated memory, in GB)
-
-    # Log to W&B
-    wandb.log(
-        {
-            "CPU Usage (%)": cpu_usage,
-            "CPU Memory Used (GB)": cpu_memory,
-            # "CPU Memory Available (GB)": cpu_available,
-            # "System Load (1min avg)": system_load,
-            # "Process RAM Used (GB)": process_memory,  # Actual memory occupied by the process
-            # "Process Virtual Memory (GB)": process_vmemory,  # Total virtual memory allocated
-        }
-    )
-
-
 def main(args: argparse.Namespace) -> None:
     checkpoint_path = args.checkpoint_path
 
@@ -486,10 +455,6 @@ def main(args: argparse.Namespace) -> None:
     # distributed training
     rank = maybe_init_dist()
     use_tp = rank is not None
-    # if use_tp:
-    #     if rank != 0:
-    #         # only print on rank 0
-    #         print = lambda *args, **kwargs: None
 
     print("Loading model ...")
     t0 = time.time()
@@ -552,16 +517,11 @@ def main(args: argparse.Namespace) -> None:
     )  # reduction is set to 'mean', thus the loss is automatically normalized by the number of tokens that are not ignored.
 
     # Training Loop
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
     print("Starting training...")
     model.train()
     model.set_train_mode(True)
 
-    best_val_loss = float("inf")
-    best_epoch = 0
     accumulated_loss = 0
-    tracemalloc.start()
-    snapshot_prev = tracemalloc.take_snapshot()
 
     for epoch in range(args.epochs):
         total_loss = 0
@@ -621,7 +581,6 @@ def main(args: argparse.Namespace) -> None:
             if (i + 1) % 100 == 0 or (i + 1) == len(train_loader):
                 torch.cuda.empty_cache()
                 gc.collect()
-                log_system_metrics()
 
         avg_train_loss = total_loss / len(train_loader)
         print(
@@ -675,45 +634,6 @@ def main(args: argparse.Namespace) -> None:
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss})
-
-        # if avg_val_loss < best_val_loss or (epoch == args.epochs - 1):
-        #     best_val_loss = avg_val_loss
-        #     save_path, temp_dir = save_lightweight_temp(
-        #         model, cache_kwargs
-        #     )  # override weights each epoch for the best val loss
-        #     parent_model_name = Path(checkpoint_path).parent.name
-        #     final = False
-
-        #     if epoch == args.epochs - 1:
-        #         # Save the final model to the model registry
-        #         final = True
-        #         print(
-        #             f"✅ Final model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
-        #         )
-        #     else:
-        #         print(
-        #             f"✅ New best model saved temporally at epoch {epoch + 1} with val loss {avg_val_loss:.4f}"
-        #         )
-
-        #     artifact = wandb.Artifact(
-        #         name="lightweight_model",
-        #         type="model",
-        #         metadata={
-        #             "epoch": epoch + 1,
-        #             "validation_loss": avg_val_loss,
-        #             "model_type": args.model_type,
-        #             "parent_model": parent_model_name,
-        #             "final": final,
-        #             "trainable_params": num_trainable_params,
-        #             "total_params_model": num_frozen_params,
-        #             "trainable_perc_model": trainable_perc_model,
-        #         },
-        #     )  # save one file per artifact
-        #     artifact.add_file(save_path)
-        #     run.link_artifact(
-        #         artifact=artifact,
-        #         target_path=registry_path,
-        #     )
 
         model.train()  # Switch back to training mode
         # model.set_train_mode(True)
