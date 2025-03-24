@@ -14,7 +14,7 @@ from tokenizer import get_tokenizer
 
 logging.basicConfig(level=logging.INFO)
 
-EVAL_LENGTH = 100
+# EVAL_LENGTH = 100
 
 
 class EvaluationTask(ABC):
@@ -847,12 +847,12 @@ class UltraChat(EvaluationTask):
             split_name = "train_gen"
         if not self.is_ready[split_name]:
             split_data = self.dataset[split_name]
-            if split == "test_gen":
-                split_data = split_data.select(
-                    range(min(len(split_data), EVAL_LENGTH))
-                )  # Limit to EVAL_LENGTH rows for now in evaluation
+            # if split == "test_gen":
+            #     split_data = split_data.select(
+            #         range(min(len(split_data), EVAL_LENGTH))
+            #     )  # Limit to EVAL_LENGTH rows for now in evaluation
 
-            elif split != "test_gen":  # Train-validation split logic
+            if split != "test_gen":  # Train-validation split logic
                 # TODO: Implement a proper train-validation split with seed and parameter setting
                 total_size = len(split_data)
 

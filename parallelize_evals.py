@@ -204,7 +204,7 @@ if __name__ == "__main__":
             ), f"{config} not found in cache_configs"
             configs.append(config)
 
-        base_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns} --compile --max_cache_length {cs}"
+        base_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns}  --max_cache_length {cs} --use_wandb"  # --compile
 
         # Create tasks and add them to the task queue.
         tasks = list(itertools.product(args.tasks, args.cache_sizes, configs))
