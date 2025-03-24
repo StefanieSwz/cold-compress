@@ -352,13 +352,6 @@ def main(
     out_dir: Path = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer."""
-    assert checkpoint_path.is_file(), checkpoint_path
-
-    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
-    if not tokenizer_path.is_file():
-        # If there's no tokenizer.model, try to load the tokenizer from the parent directory
-        # NOTE: We assume the tokenizer in the parent directory is compatible with huggingface transformers
-        tokenizer_path = checkpoint_path.parent
 
     global print
     from tp import maybe_init_dist
@@ -396,7 +389,14 @@ def main(
             cache_strategy_list = [cache_kwargs["cache_strategy"]]
         else:
             cache_strategy_list = cache_kwargs["cache_strategy"]
-        if "lightweight" in cache_strategy_list:
+        if isinstance(cache_kwargs["prompt_compression_strategy"], str):
+            prompt_strategy_list = [cache_kwargs["prompt_compression_strategy"]]
+        else:
+            prompt_strategy_list = cache_kwargs["prompt_compression_strategy"]
+        if (
+            "lightweight" in cache_strategy_list
+            or "lightweight" in prompt_strategy_list
+        ):
             model_ref = "lightweight_model:" + args.lightweight_model_version
             model_artifact = wandb.use_artifact(model_ref, type="model")
             print("Artifact contents:", model_artifact.file())
@@ -408,6 +408,34 @@ def main(
             model_path = os.path.join(temp_dir, "model.pth")
             cache_kwargs["trained_weights"] = model_path
             print(f"Using lightweight model from {model_path}")
+            # get configs
+            run_config = model_artifact.logged_by().config
+
+            print("Metadata associated with model version:")
+            checkpoint_path = Path(run_config.get("checkpoint_path"))
+            print(f"Checkpoint path: {checkpoint_path}")
+            cache_kwargs["model_type"] = run_config.get("model_type", None)
+            cache_kwargs["vector_convolution"] = run_config.get(
+                "vector_convolution", None
+            )
+            cache_kwargs["feature_selection"] = run_config.get(
+                "feature_selection", None
+            )
+            cache_kwargs["convolution_features"] = run_config.get(
+                "convolution_features", None
+            )
+            print(f"Model type: {cache_kwargs['model_type']}")
+            print(f"Vector convolution: {cache_kwargs['vector_convolution']}")
+            print(f"Feature selection: {cache_kwargs['feature_selection']}")
+            print(f"Convolution features: {cache_kwargs['convolution_features']}")
+
+    assert checkpoint_path.is_file(), checkpoint_path
+
+    tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+    if not tokenizer_path.is_file():
+        # If there's no tokenizer.model, try to load the tokenizer from the parent directory
+        # NOTE: We assume the tokenizer in the parent directory is compatible with huggingface transformers
+        tokenizer_path = checkpoint_path.parent
 
     rank = maybe_init_dist()
     use_tp = rank is not None

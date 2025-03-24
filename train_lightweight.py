@@ -345,14 +345,14 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--global_tokens",
         type=int,
-        default=4,
+        default=0,
         help="Number of global tokens.",
     )
 
     parser.add_argument(
         "--recent_window",
         type=int,
-        default=10,
+        default=0,
         help="Recent window size.",
     )
 
