@@ -1,7 +1,5 @@
 import math
-import gc
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, List
 import argparse
 from abc import ABC, abstractmethod
 from collections import Counter
@@ -1345,8 +1343,22 @@ class KVCacheLightweight(KVCacheHeadSpecific):
             if "attn_score" in self.feature_selection:
                 attn = attn.view(
                     1, self.n_heads, -1
-                )  # Reshape attention scores to [batch_size, n_heads, prompt_len]
-                self.attn_score[:] = attn.detach()  # update all attention score values
+                )  # Reshape attention scores to [batch_size, n_heads, cache_len]
+                valid_mask = self.pos != -1  # Mask out empty slots
+                n_updates = input_pos - self.pos  # [B, H, L]
+                n_updates = torch.where(
+                    valid_mask, n_updates, torch.ones_like(n_updates)
+                )
+                attn_full = self.attn_score.clone()  # attn is [B, H, cache_len]
+
+                # Update running average attention score
+                attn_full[valid_mask] = (
+                    self.attn_score[valid_mask]
+                    * (n_updates[valid_mask] - 1).to(self.attn_score.dtype)
+                    + attn[valid_mask]
+                ) / n_updates[valid_mask].to(self.attn_score.dtype)
+
+                self.attn_score[...] = attn_full.detach()
             if "token_profiling" in self.feature_selection:
                 special_mask = torch.isin(kwargs["input_ids"], self.special_ids)
                 punct_mask = torch.isin(kwargs["input_ids"], self.punctuation_ids)
