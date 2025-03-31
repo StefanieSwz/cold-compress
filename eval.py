@@ -538,10 +538,10 @@ def main(
                 json.dump(task_args_json, fd, indent=4)
 
             if args.use_wandb:
-                # Build metadata dict conditionally
                 metadata = {
                     "tasks": task_name,
                     "model_checkpoint": str(checkpoint_path),
+                    "cache_strategy": str(cache_strategy_list[0]),
                 }
                 if "model_artifact" in locals():
                     metadata["features"] = model_artifact.metadata.get("feature_selection", None)
