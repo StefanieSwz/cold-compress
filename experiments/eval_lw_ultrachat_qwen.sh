@@ -18,5 +18,4 @@ python parallelize_evals_lightweight.py \
 	--cache_sizes $CACHE_SIZES \
 	--num_samples $NUM_SAMPLES \
 	--num_gpus 8 \
-	--add_full
 
