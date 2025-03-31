@@ -3,13 +3,12 @@
 set -e
 
 MODELS=(
-	"checkpoints/meta-llama/Llama-3.2-3B-Instruct/model.pth"
 	"checkpoints/Qwen/Qwen2-1.5B-Instruct/model.pth"
 )
 NUM_SAMPLES=700
 CACHE_SIZES="0.75 0.5 0.25 0.1 0.05"
 TASKS="ultrachat"
-CACHE_CONFIGS="random l2 heavy_hitter recent_global fastgen hybrid"
+CACHE_CONFIGS="random l2 heavy_hitter recent_global"
 
 for MODEL in ${MODELS[@]}; do
 	echo "Starting evals for ${MODEL}"
