@@ -538,17 +538,21 @@ def main(
                 json.dump(task_args_json, fd, indent=4)
 
             if args.use_wandb:
+                # Build metadata dict conditionally
+                metadata = {
+                    "tasks": task_name,
+                    "model_checkpoint": str(checkpoint_path),
+                }
+                if "model_artifact" in locals():
+                    metadata["features"] = model_artifact.metadata.get("feature_selection", None)
+            
+                # Create artifact with the correct metadata
                 artifact = wandb.Artifact(
                     name="evaluation_results",
                     type="evaluation",
-                    metadata={
-                        "tasks": task_name,
-                        "model_checkpoint": str(checkpoint_path),
-                        "features": model_artifact.metadata.get(
-                            "feature_selection", None
-                        ),
-                    },
+                    metadata=metadata,
                 )
+
 
                 # Add general result files
                 if args_fn.exists():
