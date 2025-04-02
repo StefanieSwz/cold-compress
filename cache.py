@@ -1855,10 +1855,12 @@ class KVCacheHybrid(KVCacheHeavyHitter):
         if hasattr(self, "special_mask"):
             self.special_mask.zero_()
             self.num_special.zero_()
+            self.requires_special = True
 
         if hasattr(self, "punc_mask"):
             self.punc_mask.zero_()
             self.num_punc.zero_()
+            self.requires_punc = True
 
     def _decoding_update(self, input_pos, k_val, v_val, **kwargs):
         input_ids = kwargs.get("input_ids")
@@ -1977,7 +1979,6 @@ class KVCacheHybrid(KVCacheHeavyHitter):
                 strat_mask |= special_mask.view(1, 1, -1).expand(
                     n_heads, seq_len, seq_len
                 )
-
             if "punc" in name:
                 strat_mask |= punc_mask.view(1, 1, -1).expand(n_heads, seq_len, seq_len)
 
