@@ -978,6 +978,50 @@ class GSM8k(EvaluationTask):
         }
 
 
+class CNNDailyMailTask(EvaluationTask):
+    RAW_PROMPT_TEMPLATE = """You will be shown a news article. Your task is to summarize the article.
+
+====ARTICLE====
+{article}
+
+====SUMMARY====
+"""
+
+    def __init__(
+        self,
+        prompt_template: str = RAW_PROMPT_TEMPLATE,
+        max_tokens: int = 512,
+        tokenizer: Optional[Any] = None,  # pylint: disable=W0621
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            prompt_template,
+            max_tokens,
+            tokenizer=tokenizer,
+            hf_args=["abisee/cnn_dailymail", "3.0.0"],
+            **kwargs,
+        )
+
+        self.metrics = {
+            "BertScore": AutoMetric.from_name("bertscore"),
+            "Rouge": AutoMetric.from_name("rouge"),
+            # "LLM-Rouge": AutoMetric.from_name(
+            #     "llm-rouge"
+            # ),  # antropic AI very slow, optional
+            # "LLM-Judge": AutoMetric.from_name(
+            #     "llm-as-a-judge"
+            # ),  # antropic AI very slow, optional
+        }
+
+    def prepare_row(self, row):
+        prompt = self.prompt_template.format(article=row["article"])
+        return {
+            "context": row["article"],
+            "prompt": prompt,
+            "labels": row["highlights"].strip(),
+        }
+
+
 TASK_MAPPING = {
     "dolomites": Dolomites,
     "musique": Musique,
@@ -994,6 +1038,7 @@ TASK_MAPPING = {
     "truthfulqa": TruthfulQA,
     "ultrachat": UltraChat,
     "gsm8k": GSM8k,
+    "dailymail": CNNDailyMailTask,
 }
 
 
