@@ -165,7 +165,7 @@ Do NOT explain your choice. Simply return a number from 1-5.
 ====ANSWER====
 {prediction}"""
 
-PREFILL = "The score (1-5) is:"
+PREFILL = "====RESULT====\nThe score (1-5) is:"
 
 
 class LLMRouge(Metric):
@@ -246,7 +246,7 @@ class LLMRougeLlama(Metric):
         self.model.eval()
 
     def parse_int(self, text):
-        return int(re.search(r"\d+", text).group())
+        return int(re.search(r"\d", text).group())
 
     def _generate_response(self, prompt, max_new_tokens=100):
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
@@ -255,7 +255,8 @@ class LLMRougeLlama(Metric):
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                temperature=0.0,
+                temperature=None,
+                top_p=None,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
         decoded = self.tokenizer.decode(
@@ -267,7 +268,7 @@ class LLMRougeLlama(Metric):
         scores = []
 
         for p, ls in zip(predictions, labels):
-            prompt = REFERENCE_TEMPLATE.format(labels="\n---\n".join(ls), prediction=p)
+            prompt = REFERENCE_TEMPLATE.format(labels=ls, prediction=p) + PREFILL
 
             retries = 0
             while retries <= self.num_retries:
@@ -371,12 +372,14 @@ class LLMJudgeLlama(LLMRougeLlama):
 
     def parse_scorecard(self, scorecard):
         try:
-            return {
-                k: int(v)
-                for k, v in dict(
-                    re.findall(rf"({'|'.join(self.criteria)})\W+(\d+)", scorecard)
-                ).items()
-            }
+            scores = {}
+            for crit in self.criteria:
+                # Match the criterion and the next number (score 1–5) after it
+                pattern = rf"{crit}.*?(\d)"
+                match = re.search(pattern, scorecard, flags=re.IGNORECASE | re.DOTALL)
+                if match:
+                    scores[crit] = int(match.group(1))
+            return scores
         except Exception as e:
             print(e)
             raise Exception(
