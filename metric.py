@@ -292,7 +292,7 @@ LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality o
 {criteria}
 
 Respond with "criteria: score" for each criteria with a newline for each criteria.
-Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria.
+Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer. Simply return the scores in the format "criteria: score". 
 
 ====PROMPT====
 {prompt}
@@ -366,9 +366,7 @@ class LLMJudgeLlama(LLMRougeLlama):
 
         self.criteria = list(sorted([k for k in CRITERIA]))
         self.criteria_def = "\n".join([f"{k}: {CRITERIA[k]}" for k in self.criteria])
-        self.prefill = (
-            f"\n\n====SCORES for {', '.join(self.criteria)}====\n\n{self.criteria[0]}:"
-        )
+        self.prefill = f"\n\n====SCORES for {', '.join(self.criteria)}===="
 
     def parse_scorecard(self, scorecard):
         try:
@@ -401,7 +399,6 @@ class LLMJudgeLlama(LLMRougeLlama):
 
         for prompt, pred in zip(prompts, predictions):
             scorecard = self.llama_scorecard(prompt, pred)
-            print(scorecard)
             score_dict = self.parse_scorecard(scorecard)
             scores.append(score_dict)
 
