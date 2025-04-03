@@ -256,8 +256,7 @@ class LLMRougeLlama(Metric):
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                temperature=None,
-                top_p=None,
+                temperature=0.0,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
         decoded = self.tokenizer.decode(
