@@ -156,8 +156,8 @@ class RulerStringMatch(Metric):
 
 
 REFERENCE_TEMPLATE = """You are shown ground-truth answer(s) and asked to judge the quality of an LLM-generated answer.
-Assign it a score from 1-5 where 1 is the worst and 5 is the best based on how similar it is to the ground-truth(s).
-Do NOT explain your choice. Simply return a number from 1-5.
+Assign it a score from 0-9 where 0 is the worst and 9 is the best based on how similar it is to the ground-truth(s).
+Do NOT explain your choice. Simply return a number from 0-9.
 
 ====GROUND TRUTHS====
 {labels}
@@ -165,7 +165,7 @@ Do NOT explain your choice. Simply return a number from 1-5.
 ====ANSWER====
 {prediction}"""
 
-PREFILL = "====RESULT====\nThe score (1-5) is:"
+PREFILL = "====RESULT====\nThe score (0-9) is:"
 
 
 class LLMRouge(Metric):
@@ -292,7 +292,7 @@ LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality o
 {criteria}
 
 Respond with "criteria: score" for each criteria with a newline for each criteria.
-Assign a score from 1-5 where 1 is the worst and 5 is the best based on how well the answer meets the criteria.
+Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria.
 
 ====PROMPT====
 {prompt}
