@@ -961,8 +961,8 @@ class GSM8k(EvaluationTask):
         self.metrics = {
             "BertScore": AutoMetric.from_name("bertscore"),
             "Rouge": AutoMetric.from_name("rouge"),
-            "LLM-Rouge-Llama": AutoMetric.from_name("llm-rouge-llama"),
-            # "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
+            # "LLM-Rouge-Llama": AutoMetric.from_name("llm-rouge-llama"),
+            "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
         }
 
     def prepare_row(self, row):
