@@ -1,5 +1,6 @@
 import os
 import time
+import random
 
 import numpy as np
 import regex as re
@@ -292,7 +293,10 @@ LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality o
 {criteria}
 
 Respond with "criteria: score" for each criteria with a newline for each criteria.
-Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer. Simply return the scores in the format "criteria: score". 
+Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer.
+
+===EXAMPLE===
+{example}
 
 ====PROMPT====
 {prompt}
@@ -366,6 +370,9 @@ class LLMJudgeLlama(LLMRougeLlama):
 
         self.criteria = list(sorted([k for k in CRITERIA]))
         self.criteria_def = "\n".join([f"{k}: {CRITERIA[k]}" for k in self.criteria])
+        self.example = "\n".join(
+            [f"{k}: {random.randint(0, 9)}" for k in self.criteria]
+        )
         self.prefill = f"\n\n====SCORES for {', '.join(self.criteria)}===="
 
     def parse_scorecard(self, scorecard):
