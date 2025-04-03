@@ -162,7 +162,7 @@ if __name__ == "__main__":
         "--min_recovery_fractions",
         type=float,
         nargs="+",
-        default=[0.9, 0.75, 0.5, 0.25, 0.1, 0.05],
+        default=[0.75, 0.6, 0.5, 0.25, 0.1],
         help="FastGen only: the compression is decided based on min recovery fraction.",
     )
     parser.add_argument(
@@ -232,7 +232,7 @@ if __name__ == "__main__":
                 )
 
         for task, rf, config in itertools.product(
-            args.tasks, args.min_recover_factions, configs
+            args.tasks, args.min_recovery_fractions, configs
         ):
             if config == "fastgen.yaml":
                 gpu_queue.add_job(
