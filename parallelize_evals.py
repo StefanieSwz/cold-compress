@@ -159,6 +159,13 @@ if __name__ == "__main__":
         help="Cache sizes to be evaluated.",
     )
     parser.add_argument(
+        "--min_recovery_fractions",
+        type=float,
+        nargs="+",
+        default=[0.9, 0.75, 0.5, 0.25, 0.1, 0.05],
+        help="FastGen only: the compression is decided based on min recovery fraction.",
+    )
+    parser.add_argument(
         "--num_samples",
         type=int,
         default=-1,
@@ -206,20 +213,37 @@ if __name__ == "__main__":
 
         base_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns}  --max_cache_length {cs} --use_wandb"  # --compile
 
+        fastgen_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns}  --min_recovery_frac {rf} --use_wandb"  # --compile
+
         # Create tasks and add them to the task queue.
         tasks = list(itertools.product(args.tasks, args.cache_sizes, configs))
         for task, cs, config in itertools.product(
             args.tasks, args.cache_sizes, configs
         ):
-            gpu_queue.add_job(
-                base_command.format(
-                    task=task,
-                    chkpt=args.checkpoint_path,
-                    config=config,
-                    ns=args.num_samples,
-                    cs=cs,
+            if config != "fastgen.yaml":
+                gpu_queue.add_job(
+                    base_command.format(
+                        task=task,
+                        chkpt=args.checkpoint_path,
+                        config=config,
+                        ns=args.num_samples,
+                        cs=cs,
+                    )
                 )
-            )
+
+        for task, rf, config in itertools.product(
+            args.tasks, args.min_recover_factions, configs
+        ):
+            if config == "fastgen.yaml":
+                gpu_queue.add_job(
+                    fastgen_command.format(
+                        task=task,
+                        chkpt=args.checkpoint_path,
+                        config=config,
+                        ns=args.num_samples,
+                        rf=rf,
+                    )
+                )
 
         if args.add_full:
             for task in args.tasks:
