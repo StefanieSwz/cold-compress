@@ -964,9 +964,7 @@ class GSM8k(EvaluationTask):
             # "LLM-Rouge": AutoMetric.from_name(
             #     "llm-rouge"
             # ),  # antropic AI very slow, optional
-            # "LLM-Judge": AutoMetric.from_name(
-            #     "llm-as-a-judge"
-            # ),  # antropic AI very slow, optional
+            "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
         }
 
     def prepare_row(self, row):
@@ -1008,9 +1006,7 @@ class CNNDailyMailTask(EvaluationTask):
             # "LLM-Rouge": AutoMetric.from_name(
             #     "llm-rouge"
             # ),  # antropic AI very slow, optional
-            # "LLM-Judge": AutoMetric.from_name(
-            #     "llm-as-a-judge"
-            # ),  # antropic AI very slow, optional
+            "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
         }
 
     def prepare_row(self, row):

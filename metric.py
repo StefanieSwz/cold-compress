@@ -6,7 +6,8 @@ import regex as re
 from claudette import Chat, models
 from evaluate import load
 from anthropic import RateLimitError
-import regex as re
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 class Metric:
@@ -226,6 +227,63 @@ class LLMRouge(Metric):
         return {"llm_rouge": sum(scores) / len(scores)}
 
 
+class LLMRougeLlama(Metric):
+    def __init__(
+        self,
+        num_retries=5,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_retries = num_retries
+
+        # Load model and tokenizer
+        model_name = "meta-llama/Llama-3.2-3B-Instruct"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        self.model.eval()
+
+    def parse_int(self, text):
+        return int(re.search(r"\d+", text).group())
+
+    def _generate_response(self, prompt, max_new_tokens=100):
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=0.0,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        decoded = self.tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=True
+        )
+        return decoded.strip()
+
+    def compute(self, prompts, predictions, labels):
+        scores = []
+
+        for p, ls in zip(predictions, labels):
+            prompt = REFERENCE_TEMPLATE.format(labels="\n---\n".join(ls), prediction=p)
+
+            retries = 0
+            while retries <= self.num_retries:
+                try:
+                    response = self._generate_response(prompt)
+                    score = self.parse_int(response)
+                    scores.append(score)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries > self.num_retries:
+                        raise RuntimeError(f"Max retries reached. Last error: {e}")
+                    time.sleep(10)
+
+        return {"llm_rouge": np.mean(scores)}
+
+
 LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality of an LLM-generated answer on the following dimensions:
 
 ===CRITERIA===
@@ -300,6 +358,51 @@ class LLMJudge(LLMRouge):
         return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
 
 
+class LLMJudgeLlama(LLMRougeLlama):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.criteria = list(sorted([k for k in CRITERIA]))
+        self.criteria_def = "\n".join([f"{k}: {CRITERIA[k]}" for k in self.criteria])
+        self.prefill = (
+            f"\n\n====SCORES for {', '.join(self.criteria)}====\n\n{self.criteria[0]}:"
+        )
+
+    def parse_scorecard(self, scorecard):
+        try:
+            return {
+                k: int(v)
+                for k, v in dict(
+                    re.findall(rf"({'|'.join(self.criteria)})\W+(\d+)", scorecard)
+                ).items()
+            }
+        except Exception as e:
+            print(e)
+            raise Exception(
+                f"Could not parse LLM-generated scorecard for {self.__class__}:\n{scorecard}"
+            )
+
+    def llama_scorecard(self, prompt, prediction):
+        input_text = (
+            LLM_JUDGE_TEMPLATE.format(
+                criteria=self.criteria_def, prompt=prompt, prediction=prediction
+            )
+            + self.prefill
+        )
+
+        return self._generate_response(input_text, max_new_tokens=200)
+
+    def compute(self, prompts, predictions, labels):
+        scores = []
+
+        for prompt, pred in zip(prompts, predictions):
+            scorecard = self.llama_scorecard(prompt, pred)
+            score_dict = self.parse_scorecard(scorecard)
+            scores.append(score_dict)
+
+        return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
+
+
 METRIC_MAPPING = {
     "accuracy": Accuracy,
     "bertscore": BertScore,
@@ -308,6 +411,8 @@ METRIC_MAPPING = {
     "levenshtein": LevenshteinDistance,
     "llm-rouge": LLMRouge,
     "llm-as-a-judge": LLMJudge,
+    "llm-rouge-llama": LLMRougeLlama,
+    "llm-as-a-judge-llama": LLMJudgeLlama,
     "rouge": Rouge,
     "ruler-string-match": RulerStringMatch,
 }
