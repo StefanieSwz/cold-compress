@@ -401,6 +401,7 @@ class LLMJudgeLlama(LLMRougeLlama):
 
         for prompt, pred in zip(prompts, predictions):
             scorecard = self.llama_scorecard(prompt, pred)
+            print(scorecard)
             score_dict = self.parse_scorecard(scorecard)
             scores.append(score_dict)
 
