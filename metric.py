@@ -394,7 +394,10 @@ class LLMJudgeLlama(LLMRougeLlama):
     def llama_scorecard(self, prompt, prediction):
         input_text = (
             LLM_JUDGE_TEMPLATE.format(
-                criteria=self.criteria_def, prompt=prompt, prediction=prediction
+                criteria=self.criteria_def,
+                example=self.example,
+                prompt=prompt,
+                prediction=prediction,
             )
             + self.prefill
         )
