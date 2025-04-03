@@ -236,6 +236,7 @@ class LLMRougeLlama(Metric):
         super().__init__(**kwargs)
         self.num_retries = num_retries
 
+    def _load_metric(self, **kwargs):
         # Load model and tokenizer
         model_name = "meta-llama/Llama-3.2-3B-Instruct"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
