@@ -20,3 +20,5 @@ original_adapter.py
 
 torch_compile_debug
 results
+artifacts
+eval_job_logs

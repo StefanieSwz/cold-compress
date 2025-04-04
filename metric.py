@@ -255,9 +255,13 @@ class LLMRougeLlama(Metric):
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=0.0,
+                do_sample=True,
                 eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=(
+                    self.tokenizer.eos_token_id
+                    if self.tokenizer.eos_token_id
+                    else self.tokenizer.pad_token_id
+                ),
             )
         decoded = self.tokenizer.decode(
             outputs[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=True
@@ -291,11 +295,7 @@ LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality o
 ===CRITERIA===
 {criteria}
 
-Respond with "criteria: score" for each criteria with a newline for each criteria.
-Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer.
-
-===EXAMPLE===
-{example}
+Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer. Example: "helpful: 8\ncoherent: 9\nfaithful: 7".
 
 ====PROMPT====
 {prompt}
@@ -369,10 +369,10 @@ class LLMJudgeLlama(LLMRougeLlama):
 
         self.criteria = list(sorted([k for k in CRITERIA]))
         self.criteria_def = "\n".join([f"{k}: {CRITERIA[k]}" for k in self.criteria])
-        self.example = "\n".join(
-            [f"{k}: {random.randint(0, 9)}" for k in self.criteria]
-        )
         self.prefill = f"\n\n====SCORES for {', '.join(self.criteria)}===="
+        self.max_new_tokens = (
+            len(self.tokenizer("helpful: 8\ncoherent: 9\nfaithful: 7")["input_ids"]) + 5
+        )
 
     def parse_scorecard(self, scorecard):
         try:
@@ -381,8 +381,7 @@ class LLMJudgeLlama(LLMRougeLlama):
                 # Match the criterion and the next number (score 1–5) after it
                 pattern = rf"{crit}.*?(\d)"
                 match = re.search(pattern, scorecard, flags=re.IGNORECASE | re.DOTALL)
-                if match:
-                    scores[crit] = int(match.group(1))
+                scores[crit] = int(match.group(1))
             return scores
         except Exception as e:
             print(e)
@@ -394,23 +393,30 @@ class LLMJudgeLlama(LLMRougeLlama):
         input_text = (
             LLM_JUDGE_TEMPLATE.format(
                 criteria=self.criteria_def,
-                example=self.example,
                 prompt=prompt,
                 prediction=prediction,
             )
             + self.prefill
         )
 
-        return self._generate_response(input_text, max_new_tokens=200)
+        return self._generate_response(input_text, max_new_tokens=self.max_new_tokens)
 
     def compute(self, prompts, predictions, labels):
         scores = []
 
-        for prompt, pred in zip(prompts, predictions):
-            scorecard = self.llama_scorecard(prompt, pred)
-            print(scorecard)
-            score_dict = self.parse_scorecard(scorecard)
-            scores.append(score_dict)
+        for p, pred in zip(prompts, predictions):
+            retries = 0
+            while retries <= self.num_retries:
+                try:
+                    scorecard = self.llama_scorecard(p, pred)
+                    score_dict = self.parse_scorecard(scorecard)
+                    scores.append(score_dict)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries > self.num_retries:
+                        raise RuntimeError(f"Max retries reached. Last error: {e}")
+                    time.sleep(10)
 
         return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
 
