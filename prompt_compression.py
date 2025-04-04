@@ -152,8 +152,14 @@ class PromptCompressorRecentGlobal(PromptCompressorHeadConstant):
 
 class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
     """
-    Use SnapKV to compress the prompt
-    Based on the pseudo code on Page 7 of https://arxiv.org/abs/2404.14469
+    Lightweight Prompt Compressor for Transformer Models.
+
+    This class implements a cache compression mechanism based on lightweight
+    scoring models (either a linear model or an MLP) to compute token importance.
+    It follows similar ideas to methods like ScissorHands and other heavy-hitter
+    approaches as well as the L2 Norm based approach. The cache stores features such as key norms,
+    value norms, and attention scores, and it provides methods to update and
+    compute importance scores for eviction.
     """
 
     def __init__(self, head_specific, **kwargs) -> None:
@@ -284,8 +290,7 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
         """
         Compute token importance scores using lightweight models.
 
-        This function extracts features from the entire cache (key norms, value norms,
-        and attention scores) and computes an importance score for each token using a
+        This function extracts features from the entire cache and computes an importance score for each token using a
         lightweight model (either linear or MLP) per attention head. The resulting scores
         indicate which tokens in the cache are most important and have shape
         [batch_size, n_heads, max_cache_length].

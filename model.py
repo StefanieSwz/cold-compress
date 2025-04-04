@@ -523,6 +523,7 @@ class Attention(nn.Module):
                 input_pos
             )  # try normalizing the scores
             # Scale keys and values using the scores
+            # TODO: Implement entropy control of factors
             scaling_factors = torch.sigmoid(scores).unsqueeze(
                 -1
             )  # Shape: [n_heads, seq_len, 1]

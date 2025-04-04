@@ -938,7 +938,14 @@ class UltraChat(EvaluationTask):
 
 class GSM8k(EvaluationTask):
     """
-    GSM8k task with 8k context length. (context length can be adjusted as needed)
+    Evaluation task for GSM8k: Grade School Math with 8k context length.
+
+    The GSM8k benchmark consists of math word problems that test chain-of-thought
+    reasoning abilities. Each instance requires multi-step reasoning to arrive at
+    the correct answer.
+
+    This class is designed to evaluate model performance on such problems, using
+    prompts and outputs tailored for long-context (8k token) evaluation settings.
     """
 
     RAW_PROMPT_TEMPLATE = """Q: {question}\nA:"""
@@ -975,6 +982,15 @@ class GSM8k(EvaluationTask):
 
 
 class CNNDailyMailTask(EvaluationTask):
+    """
+    Evaluation task for the CNN/DailyMail summarization dataset.
+
+    This task evaluates a model's ability to generate concise and informative
+    summaries of news articles. The dataset consists of article-summary pairs
+    from CNN and Daily Mail, making it a standard benchmark for abstractive
+    summarization in NLP.
+    """
+
     RAW_PROMPT_TEMPLATE = """You will be shown a news article. Your task is to summarize the article.
 
 ====ARTICLE====

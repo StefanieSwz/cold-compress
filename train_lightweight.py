@@ -9,7 +9,6 @@ import subprocess
 from typing import Any, Dict, Optional, Iterator, Tuple
 from pathlib import Path
 from tqdm import tqdm
-import psutil
 import numpy as np
 from dotenv import load_dotenv
 import torch
