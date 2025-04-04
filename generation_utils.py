@@ -2,16 +2,17 @@ import itertools
 import time
 from typing import Optional, Tuple
 from pathlib import Path
+import argparse
 
 import torch
 import torch._dynamo.config
 import torch._inductor.config
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-import argparse
 import yaml
 from model import Transformer, find_multiple
 from tokenizer import TokenizerInterface
+from cache_utils import load_trained_lightweight
 
 default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -314,9 +315,9 @@ def apply_pyramid_pattern(
 
     if decreasing:
         cache_lens = cache_lens[::-1]
-        assert cache_lens[-1] < cache_lens[0], "Cache lengths should be decreasing."
+        assert cache_lens[-1] <= cache_lens[0], "Cache lengths should be decreasing."
     else:
-        assert cache_lens[0] < cache_lens[-1], "Cache lengths should be increasing."
+        assert cache_lens[0] <= cache_lens[-1], "Cache lengths should be increasing."
 
     return cache_lens
 
@@ -375,16 +376,33 @@ def setup_caches(
         cache_kwargs["max_cache_length"]
     ), "Global tokens must be less than max_cache_length."
 
-    if cache_kwargs["cache_strategy"][0] == "hybrid":
+    if (
+        cache_kwargs["cache_strategy"][0] == "hybrid"
+        or cache_kwargs["cache_strategy"][0] == "lightweight"
+    ):
         # We need to pass the special and punctuation token ids to the cache via cache_kwargs
         cache_kwargs["token_ids"] = {
             "special": tokenizer.special_ids(),
             "punctuation": tokenizer.punctuation_ids(),
         }
+    if cache_kwargs["cache_strategy"][0] == "lightweight":
+        # We need to pass the special and punctuation token ids to the cache via cache_kwargs
+        cache_kwargs["model_config"] = model.config
 
     with torch.device(device):
         model.setup_caches(max_batch_size=1, **cache_kwargs)
-
+        if cache_kwargs["cache_strategy"][0] == "lightweight":
+            trained_weights = cache_kwargs.get("trained_weights")
+            if isinstance(trained_weights, str) and Path(trained_weights).exists():
+                file = Path(trained_weights)
+                if file.is_file():
+                    load_trained_lightweight(model, file, load_kv=True)
+        if cache_kwargs["prompt_compression_strategy"][0] == "lightweight":
+            trained_weights = cache_kwargs.get("trained_weights")
+            if isinstance(trained_weights, str) and Path(trained_weights).exists():
+                file = Path(trained_weights)
+                if file.is_file():
+                    load_trained_lightweight(model, file, load_kv=False)
     return cache_kwargs
 
 

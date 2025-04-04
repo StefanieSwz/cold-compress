@@ -98,6 +98,15 @@ def _apply_tp_linear(
             sharded_weight = shard_qkv(linear.weight, shard_dim, weight_splits)
         if hasattr(linear, "scales") and style == "colwise":
             linear.scales = shard_qkv(linear.scales, 0, weight_splits)
+        # Handle bias (for colwise sharding only)
+        if hasattr(linear, "bias") and linear.bias is not None:
+            # Shard the bias for colwise style
+            if style == "colwise":
+                linear.bias = nn.Parameter(
+                    shard(linear.bias, shard_dim), requires_grad=False
+                )
+            else:
+                raise ValueError("Bias sharding is only applicable for colwise style.")
     else:
         sharded_weight = shard(linear.weight, shard_dim)
         if isinstance(linear, WeightOnlyInt4Linear):
@@ -131,11 +140,39 @@ def _apply_tp_ffn(mlp: FeedForward) -> None:
     _apply_tp_linear(mlp.w2, "rowwise")
 
     world_size = _get_world_size()
-    mlp.register_forward_hook(
-        lambda _module, _input, output: funcol.all_reduce(
-            output, "sum", list(range(world_size))
-        )
-    )
+
+    def sync_and_reduce(_module, _input, output):
+        """
+        Synchronize across all ranks and perform all_reduce on the output.
+        """
+        # Ensure all ranks are at the same point
+        rank = torch.distributed.get_rank()
+        print(f"[DEBUG] Rank {rank} entering forward hook.")
+        torch.distributed.barrier()  # Synchronize all ranks
+        print(f"Hook triggered on rank {torch.distributed.get_rank()}")
+        print(f"Output before all_reduce: {output}")
+
+        # Perform the all_reduce operation
+        output = funcol.all_reduce(output, "sum", list(range(world_size)))
+        print(f"Output after all_reduce: {output}")
+
+        # Ensure synchronization after the reduction
+        torch.distributed.barrier()
+
+        return output
+
+    mlp.register_forward_hook(sync_and_reduce)
+
+    # mlp.register_forward_hook(
+    #     lambda _module, _input, output: (
+    #         print(f"Hook triggered on rank {torch.distributed.get_rank()}"),
+    #         print(f"Output before all_reduce: {output}"),
+    #         funcol.all_reduce(output, "sum", list(range(world_size))),
+    #         print(f"Output after all_reduce: {output}"),
+    #     )[
+    #         2
+    #     ]  # Return only the funcol.all_reduce() result
+    # )
 
 
 def _apply_tp_attn(attn: Attention) -> None:
@@ -174,3 +211,28 @@ def apply_tp(model: Transformer) -> None:
         # Apply to MLP
         _apply_tp_ffn(block.feed_forward)
         _apply_tp_attn(block.attention)
+
+
+def handle_sigint(signum, frame):
+    """Handles SIGINT (Ctrl+C) and cleans up gracefully."""
+    print("Caught KeyboardInterrupt (SIGINT). Cleaning up gracefully...")
+    destroy_process_group_and_exit()
+
+
+def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+    """Handles uncaught exceptions and cleans up gracefully."""
+    print(f"Uncaught exception: {exc_value}")
+    destroy_process_group_and_exit()
+
+
+def destroy_process_group_and_exit():
+    """Destroys the distributed process group and exits."""
+    try:
+        if dist.is_initialized():
+            print("Destroying process group...")
+            dist.destroy_process_group()
+    except Exception as e:
+        print(f"Could not destroy process group cleanly: {e}")
+    import sys
+
+    sys.exit(1)  # Exit with non-zero status for error

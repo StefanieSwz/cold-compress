@@ -1,12 +1,14 @@
 import os
 import time
+import random
 
 import numpy as np
 import regex as re
 from claudette import Chat, models
 from evaluate import load
 from anthropic import RateLimitError
-import regex as re
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 class Metric:
@@ -155,8 +157,8 @@ class RulerStringMatch(Metric):
 
 
 REFERENCE_TEMPLATE = """You are shown ground-truth answer(s) and asked to judge the quality of an LLM-generated answer.
-Assign it a score from 1-5 where 1 is the worst and 5 is the best based on how similar it is to the ground-truth(s).
-Do NOT explain your choice. Simply return a number from 1-5.
+Assign it a score from 0-9 where 0 is the worst and 9 is the best based on how similar it is to the ground-truth(s).
+Do NOT explain your choice. Simply return a number from 0-9.
 
 ====GROUND TRUTHS====
 {labels}
@@ -164,7 +166,7 @@ Do NOT explain your choice. Simply return a number from 1-5.
 ====ANSWER====
 {prediction}"""
 
-PREFILL = "The score (1-5) is:"
+PREFILL = "====RESULT====\nThe score (0-9) is:"
 
 
 class LLMRouge(Metric):
@@ -176,7 +178,9 @@ class LLMRouge(Metric):
         self.num_retries = num_retries
 
     def _load_metric(self, **kwargs):
-        name = kwargs.get("name", "haiku")
+        name = kwargs.get(
+            "name", "claude-3-5-haiku-20241022"
+        )  # haiku got a new version, specified now "claude-3-5-haiku-20241022"
         matching_names = [m for m in models if name in m]
         assert len(matching_names) > 0, f"Model name {name} not found in {models}"
         assert (
@@ -224,13 +228,74 @@ class LLMRouge(Metric):
         return {"llm_rouge": sum(scores) / len(scores)}
 
 
+class LLMRougeLlama(Metric):
+    def __init__(
+        self,
+        num_retries=5,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.num_retries = num_retries
+
+    def _load_metric(self, **kwargs):
+        # Load model and tokenizer
+        model_name = "meta-llama/Llama-3.2-3B-Instruct"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.bfloat16, device_map="auto"
+        )
+        self.model.eval()
+
+    def parse_int(self, text):
+        return int(re.search(r"\d", text).group())
+
+    def _generate_response(self, prompt, max_new_tokens=100):
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=(
+                    self.tokenizer.eos_token_id
+                    if self.tokenizer.eos_token_id
+                    else self.tokenizer.pad_token_id
+                ),
+            )
+        decoded = self.tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[-1] :], skip_special_tokens=True
+        )
+        return decoded.strip()
+
+    def compute(self, prompts, predictions, labels):
+        scores = []
+
+        for p, ls in zip(predictions, labels):
+            prompt = REFERENCE_TEMPLATE.format(labels=ls, prediction=p) + PREFILL
+
+            retries = 0
+            while retries <= self.num_retries:
+                try:
+                    response = self._generate_response(prompt)
+                    score = self.parse_int(response)
+                    scores.append(score)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries > self.num_retries:
+                        raise RuntimeError(f"Max retries reached. Last error: {e}")
+                    time.sleep(10)
+
+        return {"llm_rouge": np.mean(scores)}
+
+
 LLM_JUDGE_TEMPLATE = """You are shown a prompt and asked to assess the quality of an LLM-generated answer on the following dimensions:
 
 ===CRITERIA===
 {criteria}
 
-Respond with "criteria: score" for each criteria with a newline for each criteria.
-Assign a score from 1-5 where 1 is the worst and 5 is the best based on how well the answer meets the criteria.
+Assign a score from 0-9 where 0 is the worst and 9 is the best based on how well the answer meets the criteria. DO NOT explain your choice or add anything else to your answer. Example: "helpful: 8\ncoherent: 9\nfaithful: 7".
 
 ====PROMPT====
 {prompt}
@@ -298,6 +363,64 @@ class LLMJudge(LLMRouge):
         return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
 
 
+class LLMJudgeLlama(LLMRougeLlama):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.criteria = list(sorted([k for k in CRITERIA]))
+        self.criteria_def = "\n".join([f"{k}: {CRITERIA[k]}" for k in self.criteria])
+        self.prefill = f"\n\n====SCORES for {', '.join(self.criteria)}===="
+        self.max_new_tokens = (
+            len(self.tokenizer("helpful: 8\ncoherent: 9\nfaithful: 7")["input_ids"]) + 5
+        )
+
+    def parse_scorecard(self, scorecard):
+        try:
+            scores = {}
+            for crit in self.criteria:
+                # Match the criterion and the next number (score 1–5) after it
+                pattern = rf"{crit}.*?(\d)"
+                match = re.search(pattern, scorecard, flags=re.IGNORECASE | re.DOTALL)
+                scores[crit] = int(match.group(1))
+            return scores
+        except Exception as e:
+            print(e)
+            raise Exception(
+                f"Could not parse LLM-generated scorecard for {self.__class__}:\n{scorecard}"
+            )
+
+    def llama_scorecard(self, prompt, prediction):
+        input_text = (
+            LLM_JUDGE_TEMPLATE.format(
+                criteria=self.criteria_def,
+                prompt=prompt,
+                prediction=prediction,
+            )
+            + self.prefill
+        )
+
+        return self._generate_response(input_text, max_new_tokens=self.max_new_tokens)
+
+    def compute(self, prompts, predictions, labels):
+        scores = []
+
+        for p, pred in zip(prompts, predictions):
+            retries = 0
+            while retries <= self.num_retries:
+                try:
+                    scorecard = self.llama_scorecard(p, pred)
+                    score_dict = self.parse_scorecard(scorecard)
+                    scores.append(score_dict)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries > self.num_retries:
+                        raise RuntimeError(f"Max retries reached. Last error: {e}")
+                    time.sleep(10)
+
+        return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
+
+
 METRIC_MAPPING = {
     "accuracy": Accuracy,
     "bertscore": BertScore,
@@ -306,6 +429,8 @@ METRIC_MAPPING = {
     "levenshtein": LevenshteinDistance,
     "llm-rouge": LLMRouge,
     "llm-as-a-judge": LLMJudge,
+    "llm-rouge-llama": LLMRougeLlama,
+    "llm-as-a-judge-llama": LLMJudgeLlama,
     "rouge": Rouge,
     "ruler-string-match": RulerStringMatch,
 }

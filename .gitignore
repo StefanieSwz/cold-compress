@@ -1,4 +1,5 @@
 __pycache__
+.env
 .idea
 .DS_Store
 *.egg-info
@@ -19,3 +20,5 @@ original_adapter.py
 
 torch_compile_debug
 results
+artifacts
+eval_job_logs

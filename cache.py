@@ -1,13 +1,15 @@
 import math
-import regex as re
+from typing import Any, List
+import argparse
 from abc import ABC, abstractmethod
 from collections import Counter
-from prompt_compression import get_prompt_compressor_constructor
-from quantization_utils import quantize_tensor, dequantize_tensor
-
-import argparse
+import regex as re
 import torch
 import torch.nn as nn
+
+from prompt_compression import get_prompt_compressor_constructor
+from cache_utils import get_convolution_params
+from quantization_utils import quantize_tensor, dequantize_tensor
 
 
 def add_cache_arguments(parser: argparse.ArgumentParser):
@@ -46,6 +48,7 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         "l2",
         "hybrid",
         "keep_it_odd",
+        "lightweight",
     ]
     debug_strategies = [f"debug_{strategy}" for strategy in strategies]
     strategies.extend(debug_strategies)
@@ -107,6 +110,50 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         default=False,
         action="store_true",
         help="Whether to accumulate number of times a token was unimportant (binary) versus raw un-normalized probabilities. If true, more memory efficient.",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="linear",
+        choices=["linear", "mlp"],
+        help="Lightweight model type: 'linear' or 'mlp'.",
+    )
+    parser.add_argument(
+        "--vector_convolution",
+        type=str,
+        default="double_conv",
+        choices=["double_conv", "single_conv", "none"],
+        help="Method for compressing vectors via convolutional layer.",
+    )
+    parser.add_argument(
+        "--convolution_features",
+        type=str,
+        nargs="+",
+        default=["embedding"],
+        choices=["key", "value", "query", "embedding"],
+        help="Which features to compress using the convolutional layer.",
+    )
+    parser.add_argument(
+        "--feature_selection",
+        type=str,
+        nargs="+",
+        default=["attn_score", "vector_norm"],
+        choices=[
+            "attn_score",
+            "vector_norm",
+            "vector_cv",
+            "vector_z_score",
+            "token_profiling",
+            "convolution",
+            "normalized_pos",
+        ],
+        help="Feature selection for lightweight model. Options: attn_score (attension score), vector_norm (l2 norm), vector_cv (coefficient of variation), vector_z_score (z-score), token_profiling (boolean for specials and punctuation tokens), convolution (selectable with --vector_convolution, adjustable to key, value, query, embedding).",
+    )
+    parser.add_argument(
+        "--trained_weights",
+        type=str,
+        default=False,
+        help="Path to lightweight model weights: Typically stored in ./lightweight_models.",
     )
 
     # Hybrid, e.g., FastGen, specific hyperparameters (--cache_strategy == "hybrid")
@@ -232,11 +279,23 @@ class KVCache(ABC, nn.Module):
 
         NB: For more performance, don't reset k_cache and v_cache since we overwrite them in update.
         """
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-        self.mask.zero_()
-        self.cache_cts.zero_()
+        attrs_to_zero = [
+            "k_cache",
+            "v_cache",
+            "mask",
+            "cache_cts",
+        ]
+
+        for attr_name in attrs_to_zero:
+            if hasattr(self, attr_name):
+                getattr(self, attr_name).zero_()
+                tensor = getattr(self, attr_name)
+                setattr(self, attr_name, tensor.detach())
+                del tensor
+
         self.pos.fill_(-1)
+        tensor = self.pos
+        self.pos = tensor.detach()
 
     def return_attn(self):
         """
@@ -336,7 +395,6 @@ class KVCache(ABC, nn.Module):
 
         # Quantize the cache after updating
         self.quantize_cache()
-
         return k, v, mask
 
     def update_state(self, *args, **kwargs):
@@ -365,7 +423,6 @@ class KVCache(ABC, nn.Module):
 
     def _eviction_idx(self, input_pos):
         scores = self._token_importances(input_pos)
-
         if scores.ndim == 1:
             scores = scores.unsqueeze(0)
 
@@ -474,7 +531,6 @@ class KVCacheHeadSpecific(KVCache):
         # input_pos [seq_len] or [num_heads, seq_len]
         # k_val, v_val [batch_size, n_heads, seq_len, head_dim]
         assert input_pos.shape[-1] == k_val.shape[2] == v_val.shape[2]
-
         # input_pos is either [seq_len] or [num_heads, seq_len]
         pos_fill_indices = fill_idxs.view(1, -1, 1)
         cache_fill_indices = fill_idxs.view(1, len(fill_idxs), 1, 1).expand(
@@ -612,6 +668,848 @@ class KVCacheL2(KVCacheHeadSpecific):
             self.key_norm.copy_(torch.linalg.vector_norm(self.k_cache, ord=2, dim=-1))
 
 
+class KVCacheLightweight(KVCacheHeadSpecific):
+    """
+    Lightweight Key-Value Cache for Transformer Models.
+
+    This class implements a cache compression mechanism based on lightweight
+    scoring models (either a linear model or an MLP) to compute token importance.
+    It follows similar ideas to methods like ScissorHands and other heavy-hitter
+    approaches as well as the L2 Norm based approach. The cache stores features such as key norms,
+    value norms, and attention scores, and it provides methods to update and
+    compute importance scores for eviction.
+
+    Attributes:
+        relevant_kwargs (List[str]): A list of keyword arguments that are relevant for cache configuration.
+    """
+
+    relevant_kwargs: List[str] = [
+        "max_cache_length",
+        "max_seq_length",
+        "cache_bits",
+        "model_config",
+        "global_tokens",
+        "recent_window",
+        "model_type",
+        "feature_selection",
+        "vector_convolution",
+        "convolution_features",
+        "token_ids",
+        "trained_weights",
+    ]
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        n_heads: int,
+        head_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+        variable_length: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the lightweight KV cache.
+
+        Args:
+            max_batch_size (int): Maximum batch size.
+            n_heads (int): Number of attention heads.
+            head_dim (int): Dimension of each head.
+            dtype (torch.dtype, optional): Data type for buffers and models. Defaults to torch.bfloat16.
+            variable_length (bool, optional): Whether the cache supports variable sequence lengths. Defaults to False.
+            **kwargs: Additional configuration arguments. Should include keys such as "model_type" and "trained_weights".
+        """
+        super().__init__(
+            max_batch_size, n_heads, head_dim, dtype, variable_length, **kwargs
+        )
+        self.feature_space_dim = 0  # Number of final features
+
+        # Initialize buffers for features.
+        # norm is l2 norm, cv is coefficient of variation (sd/mean), z is z-score (x_max - mean / sd)
+        score_shape = (max_batch_size, n_heads, self.max_cache_length)
+        if "attn_score" in kwargs["feature_selection"]:
+            self.register_buffer("attn_score", torch.zeros(score_shape, dtype=dtype))
+            self.feature_space_dim += 1
+        if "vector_norm" in kwargs["feature_selection"]:
+            self.register_buffer("key_norm", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("value_norm", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("query_norm", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer(
+                "embedding_norm", torch.zeros(score_shape, dtype=dtype)
+            )
+            self.feature_space_dim += 4
+        if "vector_cv" in kwargs["feature_selection"]:
+            self.register_buffer("key_cv", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("value_cv", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("query_cv", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("embedding_cv", torch.zeros(score_shape, dtype=dtype))
+            self.feature_space_dim += 4
+        if "vector_z_score" in kwargs["feature_selection"]:
+            self.register_buffer("key_z", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("value_z", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("query_z", torch.zeros(score_shape, dtype=dtype))
+            self.register_buffer("embedding_z", torch.zeros(score_shape, dtype=dtype))
+            self.feature_space_dim += 4
+        if "token_profiling" in kwargs["feature_selection"]:
+            special_ids_tensor = torch.tensor(
+                kwargs["token_ids"]["special"], dtype=torch.int32
+            )
+            self.register_buffer("special_ids", special_ids_tensor)
+
+            punctuation_ids_tensor = torch.tensor(
+                kwargs["token_ids"]["punctuation"], dtype=torch.int32
+            )
+            self.register_buffer("punctuation_ids", punctuation_ids_tensor)
+            self.register_buffer(
+                "token_special_profiling", torch.zeros(score_shape, dtype=dtype)
+            )
+            self.register_buffer(
+                "token_punctuation_profiling", torch.zeros(score_shape, dtype=dtype)
+            )
+            self.feature_space_dim += 2
+        if "convolution" in kwargs["feature_selection"]:
+            self.conv_layers = nn.ModuleDict()
+
+            # kwargs["convolution_features"] is a list like ["key", "value", "query", "embedding"]
+            for feat in kwargs["convolution_features"]:
+                if feat == "embedding":
+                    input_dim = kwargs["model_config"].dim
+                else:
+                    input_dim = head_dim
+                (
+                    kernel_1,
+                    kernel_2,
+                    self.conv_compression_rate,
+                    self.conv_hidden_channels,
+                ) = get_convolution_params(input_dim, target_features=6)
+                # must be 2^x, otherwise double conv does not necessarily work
+                # self.conv_compression_rate = 16
+                result_conv_dim = input_dim // self.conv_compression_rate
+
+                if kwargs["vector_convolution"] == "double_conv":
+                    self.conv_layers[feat] = nn.Sequential(
+                        nn.Conv1d(
+                            in_channels=1,
+                            out_channels=self.conv_hidden_channels,
+                            kernel_size=kernel_1,
+                            stride=kernel_1,
+                        ).to(torch.bfloat16),
+                        nn.ReLU(),
+                        nn.Conv1d(
+                            in_channels=self.conv_hidden_channels,
+                            out_channels=1,
+                            kernel_size=kernel_2,
+                            stride=kernel_2,
+                        ).to(torch.bfloat16),
+                    )
+                    buffer_shape = (
+                        max_batch_size,
+                        n_heads,
+                        self.max_cache_length,
+                        result_conv_dim,
+                    )
+                    self.register_buffer(
+                        f"{feat}_conv_values", torch.zeros(buffer_shape, dtype=dtype)
+                    )
+                    self.feature_space_dim += result_conv_dim
+
+                elif kwargs["embedding_compression"] == "single_conv":
+                    self.conv_layers[feat] = nn.Sequential(
+                        nn.Conv1d(
+                            in_channels=1,
+                            out_channels=self.conv_hidden_channels,
+                            kernel_size=self.conv_compression_rate
+                            * self.conv_hidden_channels,
+                            stride=self.conv_compression_rate
+                            * self.conv_hidden_channels,
+                        ).to(torch.bfloat16),
+                        nn.ReLU(),
+                        nn.Flatten(),
+                    )
+                    buffer_shape = (
+                        max_batch_size,
+                        n_heads,
+                        self.max_cache_length,
+                        result_conv_dim,
+                    )
+                    self.register_buffer(
+                        f"{feat}_conv_values", torch.zeros(buffer_shape, dtype=dtype)
+                    )
+                    self.feature_space_dim += result_conv_dim
+                else:
+                    print("No convolution feature initialized")
+        if "normalized_pos" in kwargs["feature_selection"]:
+            # no buffer needed as computed directly in token_importance
+            self.feature_space_dim += 1
+        # Initialize lightweight models for computing token scores.
+        if kwargs["model_type"] == "linear":
+            self.models = nn.ModuleList(
+                [nn.Linear(self.feature_space_dim, 1).to(dtype) for _ in range(n_heads)]
+            )
+        elif kwargs["model_type"] == "mlp":
+            self.lightweight_hidden_size = 2 * self.feature_space_dim
+            self.models = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(self.feature_space_dim, self.lightweight_hidden_size),
+                        nn.ReLU(),
+                        nn.Linear(self.lightweight_hidden_size, 1),
+                    ).to(dtype)
+                    for _ in range(n_heads)
+                ]
+            )
+        else:
+            raise ValueError("Unsupported model_type. Use 'linear' or 'mlp'.")
+
+        def init_weights(m):
+            # You can choose a specific initialization for Conv1d and Linear layers
+            # if isinstance(m, (nn.Conv1d, nn.Linear)):
+            #     # For example, Kaiming normal initialization for layers with ReLU activation:
+            #     torch.nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+            #     if m.bias is not None:
+            #         torch.nn.init.constant_(m.bias, 0)
+            # Alternatively, if you prefer a normal distribution with mean=0 and std=0.02:
+            if hasattr(m, "weight") and m.weight is not None:
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if hasattr(m, "bias") and m.bias is not None:
+                torch.nn.init.normal_(m.bias, mean=0.0, std=0.02)
+
+        # Initialize the models' parameters with random weights.
+        # Trained weights are loaded from model perspective
+        with torch.no_grad():
+            if "convolution" in kwargs["feature_selection"]:
+                for feat, conv_block in self.conv_layers.items():
+                    conv_block.apply(init_weights)
+            for model in self.models:
+                model.apply(init_weights)
+
+    def reset(self) -> None:
+        """
+        Reset the cache buffers.
+
+        This clears all feature buffer and detaches them from the computational graph.
+        """
+        super().reset()
+        attrs_to_zero = [
+            "attn_score",
+            "key_norm",
+            "value_norm",
+            "query_norm",
+            "embedding_norm",
+            "key_cv",
+            "value_cv",
+            "query_cv",
+            "embedding_cv",
+            "key_z",
+            "value_z",
+            "query_z",
+            "embedding_z",
+            "special_ids",
+            "punctuation_ids",
+            "token_special_profiling",
+            "token_punctuation_profiling",
+            "key_conv_values",
+            "value_conv_values",
+            "query_conv_values",
+            "embedding_conv_values",
+        ]
+
+        for attr_name in attrs_to_zero:
+            if hasattr(self, attr_name):
+                getattr(self, attr_name).zero_()
+                tensor = getattr(self, attr_name)
+                setattr(self, attr_name, tensor.detach())
+                del tensor
+
+    def return_attn(self) -> bool:
+        """
+        Indicate that this cache returns attention scores.
+
+        Returns:
+            bool: Always True for this cache.
+        """
+        return True
+
+    def filter_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Filters vectors from x using indices provided by self.pos.
+        self.pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
+                                    or -1 indicating an unfilled slot.
+
+        Args:
+            x (torch.Tensor): Tensor of shape [B, T, D] containing token embeddings.
+
+        Returns:
+            torch.Tensor: A tensor of shape [B, H, M, D] where for each (B, H, M) slot, if input_pos has a valid
+                        index, the corresponding token embedding from x is gathered; otherwise, the slot is zeroed.
+        """
+        # Get dimensions.
+        B, H, M = self.pos.shape
+        _, T, D = x.shape
+
+        # Expand x to include a head dimension.
+        # x is originally [B, T, D]. We expand it to [B, 1, T, D] and then to [B, H, T, D].
+        x_exp = x.unsqueeze(1).expand(B, H, T, D)
+
+        # Create a boolean mask for valid positions (positions not equal to -1).
+        valid_mask = self.pos != -1  # shape: [B, H, M]
+
+        # Create safe indices to use with gather: replace -1 with 0.
+        safe_indices = self.pos.clone()
+        safe_indices[~valid_mask] = 0  # shape: [B, H, M]
+        safe_indices = safe_indices.to(torch.long)
+
+        # Prepare safe_indices for torch.gather by unsqueezing and expanding to match x_exp's D dimension.
+        safe_indices = safe_indices.unsqueeze(-1).expand(
+            B, H, M, D
+        )  # shape: [B, H, M, D]
+
+        # Gather the vectors along the sequence dimension (dim=2) from x_exp.
+        gathered = torch.gather(
+            x_exp, dim=2, index=safe_indices.to(torch.int64)
+        )  # shape: [B, H, M, D]
+
+        # Zero out the positions where input_pos was -1.
+        filtered = gathered * valid_mask.unsqueeze(-1).type_as(gathered)
+
+        return filtered
+
+    def filter_query(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Filters vectors from x using indices provided by self.pos.
+                self.pos (torch.Tensor): Tensor of shape [B, H, M]. Each element is a token index in [0, T)
+                                or -1 indicating an unfilled slot.
+
+        Args:
+            x (torch.Tensor): Tensor of shape [B, H, T, D] containing token embeddings.
+
+        Returns:
+            torch.Tensor: A tensor of shape [B, H, M, D] where for each (B, H, M) slot, if input_pos has a valid
+                        index, the corresponding token embedding from x is gathered; otherwise, the slot is zeroed.
+        """
+        # Get dimensions.
+        B, H, M = self.pos.shape
+        _, _, T, D = x.shape
+
+        # Create a boolean mask for valid positions (positions not equal to -1).
+        valid_mask = self.pos != -1  # shape: [B, H, M]
+
+        # Create safe indices to use with gather: replace -1 with 0.
+        safe_indices = self.pos.clone()
+        safe_indices[~valid_mask] = 0  # shape: [B, H, M]
+
+        # Prepare safe_indices for torch.gather by unsqueezing and expanding to match x's D dimension.
+        safe_indices = safe_indices.unsqueeze(-1).expand(
+            B, H, M, D
+        )  # shape: [B, H, M, D]
+
+        # Gather the vectors along the sequence dimension (dim=2) from x.
+        gathered = torch.gather(
+            x, dim=2, index=safe_indices.to(torch.int64)
+        )  # shape: [B, H, M, D]
+
+        # Zero out the positions where input_pos was -1.
+        filtered = gathered * valid_mask.unsqueeze(-1).type_as(gathered)
+
+        return filtered
+
+    def build_ids_mask(self, input_ids, token_ids):
+        """
+        Builds a special token mask from input_ids and expands it using self.pos.
+
+        Args:
+            input_ids (torch.Tensor): A tensor of shape [B, seq_len] containing token IDs.
+            token_ids (List(torch.Tensor)): A list of ids that are belonging to either special or punctuation tokens.
+
+        Returns:
+            torch.Tensor: A boolean mask of shape [B, n_heads, max_cache_len] where True indicates that
+                        the token at that cache position (as given by self.pos) is a special token.
+        """
+        B, seq_len = input_ids.shape
+        ids_mask = torch.isin(input_ids, token_ids)  # Shape: [B, seq_len]
+        # Expand to [B, n_heads, seq_len]
+        mask_exp = ids_mask.unsqueeze(1).expand(B, self.n_heads, seq_len)
+
+        # Valid mask for self.pos (-1 means unfilled slots)
+        valid_mask = self.pos != -1  # Shape: [B, n_heads, max_cache_len]
+
+        # Replace -1 with 0 to safely index into mask_exp
+        safe_pos = self.pos.clone()
+        safe_pos[~valid_mask] = 0  # Shape: [B, n_heads, max_cache_len]
+
+        # Gather mask values at positions specified by self.pos
+        expanded_mask = torch.gather(mask_exp, dim=2, index=safe_pos.to(torch.int64))
+
+        # Ensure positions where self.pos was -1 remain False
+        return expanded_mask & valid_mask
+
+    def compute_cv(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the coefficient of variation of a tensor along the last dimension.
+
+        The cv is defined as:
+            cv = std / mean
+        for each row along the last dimension. If the mean is zero,
+        the corresponding cv-score is set to zero to avoid division by zero.
+
+        Args:
+            tensor (Tensor): Input tensor of arbitrary shape. The z-score is computed
+                            along the last dimension.
+
+        Returns:
+            Tensor: A tensor of the same shape as `tensor` with the last dimension reduced,
+                    containing the computed cv-scores.
+        """
+        mean_val = torch.mean(tensor, dim=-1)
+        std_val = torch.std(tensor, dim=-1, unbiased=False)
+        # Avoid division by zero:
+        return torch.where(
+            mean_val == 0, torch.zeros_like(mean_val), std_val / mean_val
+        )
+
+    def compute_z_score(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the z-score of a tensor along the last dimension.
+
+        The z-score is defined as:
+            z = (max - mean) / std
+        for each row along the last dimension. If the standard deviation is zero,
+        the corresponding z-score is set to zero to avoid division by zero.
+
+        Args:
+            tensor (Tensor): Input tensor of arbitrary shape. The z-score is computed
+                            along the last dimension.
+
+        Returns:
+            Tensor: A tensor of the same shape as `tensor` with the last dimension reduced,
+                    containing the computed z-scores.
+        """
+        max_val = torch.max(tensor, dim=-1).values
+        mean_val = torch.mean(tensor, dim=-1)
+        std_val = torch.std(tensor, dim=-1, unbiased=False)
+        z_score = torch.where(
+            std_val == 0, torch.zeros_like(std_val), (max_val - mean_val) / std_val
+        )
+        return z_score
+
+    def update_state(  # pylint: disable=W0221
+        self,
+        input_pos: torch.Tensor,
+        k_val: torch.Tensor,
+        v_val: torch.Tensor,
+        is_prefill: bool,
+        attn: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Update the cache state.
+
+        For prefill mode, this updates the entire cache of features for the current prompt. In generation mode, only the newly
+        generated token's information is updated.
+
+        Args:
+            input_pos (torch.Tensor): Input positions in the sequence.
+            k_val (torch.Tensor): Key values with shape [batch_size, n_heads, seq_len, head_dim].
+            v_val (torch.Tensor): Value values with shape [batch_size, n_heads, seq_len, head_dim].
+            is_prefill (bool): True if in prefill phase; False if in generation phase.
+            attn (torch.Tensor): Attention scores with shape [batch_size, n_heads, seq_len, seq_len].
+            **kwargs: Additional keyword arguments.
+        """
+        with torch.no_grad():
+            x = kwargs[
+                "x"
+            ]  # x.shape = [batch_size, sequence_length, model_hidden_dim = n_query_heads * head_dim]
+            q = kwargs[
+                "query"
+            ]  # q.shape = [batch_size, n_query_heads, sequence_length, head dim]
+            batch_size, n_query_heads, seq_len, head_dim = q.shape
+            # seq_len is 1 for not prefill, and complete sequence length for prefill, that can be larger then max_cache_length
+            group_size = n_query_heads // self.n_heads
+            q_grouped = q.view(batch_size, self.n_heads, group_size, seq_len, head_dim)
+            q_avg = q_grouped.mean(dim=2)  # [batch_size, n_heads, seq_len, head_dim]
+            max_cache_len = self.pos.shape[2]
+        if is_prefill:
+            with torch.no_grad():
+                x_filtered = self.filter_embedding(x)
+                # shape = [batch_size, n_heads, max_cache_length, model_hidden_dim = n_query_heads * head_dim]
+                q_filtered = self.filter_query(q_avg)
+                # shape = [batch_size, n_heads, max_cache_length, head_dim]
+                if "vector_norm" in self.feature_selection:
+                    # Calculate norms over the head dimension.
+                    # key and value already filtered by prompt compressor
+                    key_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        k_val, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len/prompt_len]
+                    value_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        v_val, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len/prompt_len]
+                    query_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        q_filtered, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len]
+                    embedding_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                        x_filtered, ord=2, dim=-1
+                    )  # [batch_size, n_heads, max_cache_len]
+                    if seq_len < max_cache_len:
+                        self.key_norm[:, :, :seq_len] = key_norm.detach()
+                        self.value_norm[:, :, :seq_len] = value_norm.detach()
+                        self.query_norm = query_norm.detach()
+                        self.embedding_norm = embedding_norm.detach()
+                    else:
+                        self.key_norm = key_norm.detach()
+                        self.value_norm = value_norm.detach()
+                        self.query_norm = query_norm.detach()
+                        self.embedding_norm = embedding_norm.detach()
+                if "vector_cv" in self.feature_selection:
+                    key_cv = self.compute_cv(k_val)
+                    value_cv = self.compute_cv(v_val)
+                    query_cv = self.compute_cv(q_filtered)
+                    embedding_cv = self.compute_cv(x_filtered)
+                    if seq_len < max_cache_len:
+                        self.key_cv[:, :, :seq_len] = key_cv.detach()
+                        self.value_cv[:, :, :seq_len] = value_cv.detach()
+                        self.query_cv = query_cv.detach()
+                        self.embedding_cv = embedding_cv.detach()
+                    else:
+                        self.key_cv = key_cv.detach()
+                        self.value_cv = value_cv.detach()
+                        self.query_cv = query_cv.detach()
+                        self.embedding_cv = embedding_cv.detach()
+                if "vector_z_score" in self.feature_selection:
+                    key_z = self.compute_z_score(k_val)
+                    value_z = self.compute_z_score(v_val)
+                    query_z = self.compute_z_score(q_filtered)
+                    embedding_z = self.compute_z_score(x_filtered)
+                    if seq_len < max_cache_len:
+                        self.key_z[:, :, :seq_len] = key_z.detach()
+                        self.value_z[:, :, :seq_len] = value_z.detach()
+                        self.query_z = query_z.detach()
+                        self.embedding_z = embedding_z.detach()
+                    else:
+                        self.key_z = key_z.detach()
+                        self.value_z = value_z.detach()
+                        self.query_z = query_z.detach()
+                        self.embedding_z = embedding_z.detach()
+                if "attn_score" in self.feature_selection:
+                    if attn.ndim == 4:
+                        seq_len_actual = attn.shape[-1]
+                        attn = attn.squeeze(0).sum(dim=1) / (seq_len_actual - input_pos)
+                    attn = attn.view(
+                        1, self.n_heads, -1
+                    )  # [batch_size, n_heads, prompt_len]
+                    # can handle both cases, already compressed version from prompt compressor or if prompt_len < cache-len
+                    seq_len_actual = attn.shape[-1]
+                    self.attn_score[:, :, :seq_len_actual] = attn.detach()
+                if "token_profiling" in self.feature_selection:
+                    # Token profiling features
+                    # input_ids: shape (batch, seq_len)
+                    token_special_profiling = self.build_ids_mask(
+                        kwargs["input_ids"], self.special_ids
+                    )
+                    token_punctuation_profiling = self.build_ids_mask(
+                        kwargs["input_ids"], self.punctuation_ids
+                    )
+                    # shape (batch, n_heads, max_cache_len)
+                    self.token_special_profiling = token_special_profiling.detach()
+                    self.token_punctuation_profiling = (
+                        token_punctuation_profiling.detach()
+                    )
+            if "convolution" in self.feature_selection:
+                feature_dict = {
+                    "embedding": x_filtered,
+                    "query": q_filtered,
+                    "key": k_val,
+                    "value": v_val,
+                }
+                valid_mask = (self.pos != -1).clone().detach()  # shape: [B, H, M]
+                # Find indices of valid slots.
+                valid_idx = torch.nonzero(
+                    valid_mask
+                )  # shape: [N_valid, 3], where 3 is [batch_idx, head_idx, cache_slot_idx]
+                for feat in self.convolution_features:
+                    # Get the filtered tensor for this feature.
+                    feat_tensor = (
+                        feature_dict[feat].clone().detach()
+                    )  # shape: [B, H, M, D]
+
+                    # Gather only valid vectors using the valid indices.
+                    # valid_idx has columns: [batch_idx, head_idx, cache_slot_idx].
+                    token_vectors = feat_tensor[
+                        valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
+                    ]  # shape: [N_valid, D]
+
+                    # Prepare for convolution: Conv1d expects input [N, in_channels, width].
+                    # Here, treat each token vector as width=D with in_channels=1.
+                    tokens_for_conv = token_vectors.unsqueeze(
+                        1
+                    )  # shape: [N_valid, 1, D]
+
+                    # Apply the convolution for this feature.
+                    # Assume self.conv_layers[feat] is your convolution module.
+                    conv_out = self.conv_layers[feat](tokens_for_conv).squeeze(
+                        1
+                    )  # shape: [N_valid, F]
+
+                    # Min-Max Normalization
+                    conv_out_min = conv_out.min(dim=-1, keepdim=True)[0]
+                    conv_out_max = conv_out.max(dim=-1, keepdim=True)[0]
+                    range_ = conv_out_max - conv_out_min
+
+                    # Normalize only where range_ > 0, otherwise set to 0
+                    conv_out = torch.where(
+                        range_ > 0,
+                        (conv_out - conv_out_min) / range_,
+                        torch.zeros_like(conv_out),
+                    )
+
+                    # Scatter the convolution output back into the appropriate buffer.
+                    # Assume the buffer is stored as an attribute named, for example, "embedding_conv_values".
+                    buffer_attr = f"{feat}_conv_values"  # e.g., "embedding_conv_values"
+                    conv_buffer = getattr(self, buffer_attr)  # shape: [B, H, M, F]
+
+                    conv_buffer[
+                        valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
+                    ] = conv_out  # dont detach here as convolution must be trained
+
+        else:
+            # Generation phase: update only the new token's key and value norms,
+            # and update full attention scores.
+            # not used for training, only for generation
+            idx = torch.where(self.pos == input_pos)[
+                2
+            ]  # Find cache index per head for current input_pos
+            if "vector_norm" in self.feature_selection:
+                # Use advanced indexing: for each head, select the corresponding vector using idx.
+                key_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                    k_val[:, torch.arange(self.n_heads), idx, :],
+                    ord=2,
+                    dim=-1,
+                    keepdim=True,
+                ).squeeze(-1)
+                value_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                    v_val[:, torch.arange(self.n_heads), idx, :],
+                    ord=2,
+                    dim=-1,
+                    keepdim=True,
+                ).squeeze(-1)
+                query_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                    q_avg.squeeze(2),
+                    ord=2,
+                    dim=-1,
+                    keepdim=True,
+                ).squeeze(-1)
+                embedding_norm = torch.linalg.vector_norm(  # pylint: disable=E1102
+                    x.squeeze(1),
+                    ord=2,
+                    dim=-1,
+                    keepdim=True,
+                )
+                # Update only the current token's norms.
+                self.key_norm[:, torch.arange(self.n_heads), idx] = key_norm.detach()
+                self.value_norm[:, torch.arange(self.n_heads), idx] = (
+                    value_norm.detach()
+                )
+                self.query_norm[:, torch.arange(self.n_heads), idx] = (
+                    query_norm.detach()
+                )
+                self.embedding_norm[:, torch.arange(self.n_heads), idx] = (
+                    embedding_norm.expand(batch_size, self.n_heads)
+                ).detach()
+            if "vector_cv" in self.feature_selection:
+                key_cv = self.compute_cv(k_val[:, torch.arange(self.n_heads), idx, :])
+                value_cv = self.compute_cv(v_val[:, torch.arange(self.n_heads), idx, :])
+                query_cv = self.compute_cv(q_avg).squeeze(-1)
+                embedding_cv = self.compute_cv(x).expand(batch_size, self.n_heads)
+                self.key_cv[:, torch.arange(self.n_heads), idx] = key_cv.detach()
+                self.value_cv[:, torch.arange(self.n_heads), idx] = value_cv.detach()
+                self.query_cv[:, torch.arange(self.n_heads), idx] = query_cv.detach()
+                self.embedding_cv[:, torch.arange(self.n_heads), idx] = (
+                    embedding_cv.detach()
+                )
+            if "vector_z_score" in self.feature_selection:
+                key_z = self.compute_z_score(
+                    k_val[:, torch.arange(self.n_heads), idx, :]
+                )
+                value_z = self.compute_z_score(
+                    v_val[:, torch.arange(self.n_heads), idx, :]
+                )
+                query_z = self.compute_z_score(q_avg).squeeze(-1)
+                embedding_z = self.compute_z_score(x).expand(batch_size, self.n_heads)
+                self.key_z[:, torch.arange(self.n_heads), idx] = key_z.detach()
+                self.value_z[:, torch.arange(self.n_heads), idx] = value_z.detach()
+                self.query_z[:, torch.arange(self.n_heads), idx] = query_z.detach()
+                self.embedding_z[:, torch.arange(self.n_heads), idx] = (
+                    embedding_z.detach()
+                )
+            if "attn_score" in self.feature_selection:
+                attn = attn.view(
+                    1, self.n_heads, -1
+                )  # Reshape attention scores to [batch_size, n_heads, cache_len]
+                valid_mask = self.pos != -1  # Mask out empty slots
+                n_updates = input_pos - self.pos  # [B, H, L]
+                n_updates = torch.where(
+                    valid_mask, n_updates, torch.ones_like(n_updates)
+                )
+                attn_full = self.attn_score.clone()  # attn is [B, H, cache_len]
+
+                # Update running average attention score
+                attn_full[valid_mask] = (
+                    self.attn_score[valid_mask]
+                    * (n_updates[valid_mask] - 1).to(self.attn_score.dtype)
+                    + attn[valid_mask]
+                ) / n_updates[valid_mask].to(self.attn_score.dtype)
+
+                self.attn_score[...] = attn_full.detach()
+            if "token_profiling" in self.feature_selection:
+                special_mask = torch.isin(kwargs["input_ids"], self.special_ids)
+                punct_mask = torch.isin(kwargs["input_ids"], self.punctuation_ids)
+                special_mask_exp = special_mask.expand(batch_size, self.n_heads)
+                punct_mask_exp = punct_mask.expand(batch_size, self.n_heads)
+
+                self.token_special_profiling[:, torch.arange(self.n_heads), idx] = (
+                    special_mask_exp.detach()
+                )  # save as bool here
+                self.token_punctuation_profiling[:, torch.arange(self.n_heads), idx] = (
+                    punct_mask_exp.detach()
+                )  # save as bool here
+            if "convolution" in self.feature_selection:
+                feature_dict = {
+                    "embedding": x,  # size (batch, 1, head dim) # works like that
+                    "query": q_avg.squeeze(2),  # size (batch, n_heads, head dim)
+                    "key": k_val[
+                        :, torch.arange(self.n_heads), idx, :
+                    ],  # size (batch, n_heads, head dim)
+                    "value": v_val[
+                        :, torch.arange(self.n_heads), idx, :
+                    ],  # size (batch, n_heads, head dim)
+                }
+                for feat in self.convolution_features:
+                    # Get the filtered tensor for this feature.
+                    feat_tensor = feature_dict[feat].clone().detach()
+                    # Get the convolution layer for this feature.
+                    conv_block = self.conv_layers[feat]
+                    # Get the buffer for this feature.
+                    buffer_attr = f"{feat}_conv_values"
+                    conv_buffer = getattr(self, buffer_attr)
+                    if feat == "embedding":
+                        vector_conv = conv_block(feat_tensor)
+                        vector_conv = vector_conv.expand(batch_size, self.n_heads, -1)
+                        # size (batch, n_heads, result feature dim)
+                    else:
+                        vector_conv = conv_block(
+                            feat_tensor.view(batch_size * self.n_heads, 1, head_dim)
+                        )
+                        vector_conv = vector_conv.view(batch_size, self.n_heads, -1)
+                        # size (batch, n_heads, result feature dim)
+                    conv_buffer[:, torch.arange(self.n_heads), idx, :] = vector_conv
+
+    def _eviction_idx(self, input_pos):
+        scores = self._token_importances(input_pos)
+        if scores.ndim == 1:
+            scores = scores.unsqueeze(0)
+
+        # Protect global tokens
+        scores[:, : self.global_tokens] = float("inf")
+
+        # Evict unfilled slots (pos == -1)
+        scores.masked_fill_(self.pos.view(scores.shape) == -1, float("-inf"))
+
+        # Apply masking to protect recent tokens based on the observation window
+        # squeeze pos as not batch compatible
+        scores.masked_fill_(
+            self.pos.squeeze(0) >= input_pos - self.recent_window, float("inf")
+        )
+
+        # Evict least important token
+        return torch.argmin(scores, dim=-1)
+
+    def _token_importances(self, input_pos: torch.Tensor) -> torch.Tensor:
+        """
+        Compute token importance scores using lightweight models.
+
+        This function extracts features from the entire cache and computes an importance score for each token using a
+        lightweight model (either linear or MLP) per attention head. The resulting scores
+        indicate which tokens in the cache are most important and have shape
+        [batch_size, n_heads, max_cache_length].
+
+        Args:
+            input_pos (torch.Tensor): The input positions in the sequence.
+
+        Returns:
+            torch.Tensor: Token importance scores with shape [batch_size, n_heads, max_cache_length].
+        """
+        max_cache_length = self.pos.shape[-1]
+
+        features_to_cat = []
+        if "attn_score" in self.feature_selection:
+            features_to_cat.append(self.attn_score.unsqueeze(-1))
+        if "vector_norm" in self.feature_selection:
+            features_to_cat.extend(
+                [
+                    self.key_norm.unsqueeze(-1),
+                    self.value_norm.unsqueeze(-1),
+                    self.query_norm.unsqueeze(-1),
+                    self.embedding_norm.unsqueeze(-1),
+                ]
+            )
+        if "vector_cv" in self.feature_selection:
+            features_to_cat.extend(
+                [
+                    self.key_cv.unsqueeze(-1),
+                    self.value_cv.unsqueeze(-1),
+                    self.query_cv.unsqueeze(-1),
+                    self.embedding_cv.unsqueeze(-1),
+                ]
+            )
+        if "vector_z_score" in self.feature_selection:
+            features_to_cat.extend(
+                [
+                    self.key_z.unsqueeze(-1),
+                    self.value_z.unsqueeze(-1),
+                    self.query_z.unsqueeze(-1),
+                    self.embedding_z.unsqueeze(-1),
+                ]
+            )
+        if "token_profiling" in self.feature_selection:
+            features_to_cat.extend(
+                [
+                    self.token_special_profiling.unsqueeze(-1),
+                    self.token_punctuation_profiling.unsqueeze(-1),
+                ]
+            )
+        if "convolution" in self.feature_selection:
+            for feat in self.convolution_features:
+                buffer_attr = f"{feat}_conv_values"
+                features_to_cat.append(getattr(self, buffer_attr))
+        if "normalized_pos" in self.feature_selection:
+            normalized_pos = self.pos.float() / input_pos[-1].float()
+            features_to_cat.append(normalized_pos.unsqueeze(-1))
+
+        features_to_cat = [feature.to(torch.bfloat16) for feature in features_to_cat]
+        features = torch.cat(features_to_cat, dim=3)
+
+        # Initialize scores with -infinity for all cache slots
+        scores = torch.full(
+            (features.shape[0], self.n_heads, max_cache_length),
+            float("-inf"),
+            dtype=features.dtype,
+            device=features.device,
+        )
+
+        # Compute scores for the current valid positions using the lightweight models
+        for head_idx, model in enumerate(self.models):
+            valid = self.pos[:, head_idx, :] != -1  # Boolean mask of valid positions
+            if valid.any():
+                # Compute scores for valid positions and update the scores tensor
+                scores[:, head_idx, :][valid] = model(
+                    features[:, head_idx, :][valid]
+                ).squeeze(-1)
+
+        # Remove batch dimension if batch_size == 1, as the method is not batch-compatible yet
+        if scores.shape[0] == 1:
+            scores = scores.squeeze(0)  # Resulting shape: [n_heads, max_cache_length]
+
+        return scores
+
+
 class KVCacheHeavyHitter(KVCacheHeadSpecific):
     # This class mostly follows the logic in ScissorHands (https://arxiv.org/abs/2305.17118)
     # But it is very similar to other Heavy Hitter methods (H20, PyramidKV, etc.)
@@ -661,9 +1559,7 @@ class KVCacheHeavyHitter(KVCacheHeadSpecific):
         history_num_dtype = (
             torch.bool
             if self.attn_thresholding
-            else torch.float64
-            if self.history_window_size == 1
-            else dtype
+            else torch.float64 if self.history_window_size == 1 else dtype
         )
         self.register_buffer(
             "attn_history_num",
@@ -957,10 +1853,12 @@ class KVCacheHybrid(KVCacheHeavyHitter):
         if hasattr(self, "special_mask"):
             self.special_mask.zero_()
             self.num_special.zero_()
+            self.requires_special = True
 
         if hasattr(self, "punc_mask"):
             self.punc_mask.zero_()
             self.num_punc.zero_()
+            self.requires_punc = True
 
     def _decoding_update(self, input_pos, k_val, v_val, **kwargs):
         input_ids = kwargs.get("input_ids")
@@ -1079,7 +1977,6 @@ class KVCacheHybrid(KVCacheHeavyHitter):
                 strat_mask |= special_mask.view(1, 1, -1).expand(
                     n_heads, seq_len, seq_len
                 )
-
             if "punc" in name:
                 strat_mask |= punc_mask.view(1, 1, -1).expand(n_heads, seq_len, seq_len)
 
@@ -1457,6 +2354,8 @@ def get_cache_constructor(cache_strategy):
         cls = KVCacheHybrid
     elif cache_strategy == "keep_it_odd":
         cls = KVCacheKeepItOdd
+    elif cache_strategy == "lightweight":
+        cls = KVCacheLightweight
     elif cache_strategy.startswith("debug"):
         cache_strategy = re.sub(r"debug_+", "", cache_strategy).strip()
         relevant_kwargs = get_cache_constructor(cache_strategy)[1] + [

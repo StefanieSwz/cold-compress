@@ -3,9 +3,10 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from collections import defaultdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+import json
 
 import math
 import torch
@@ -14,7 +15,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from attention_utils import scaled_dot_product_attention
-from cache import get_cache_constructor
+from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
 
 
@@ -69,6 +70,13 @@ class ModelArgs:
             ), name  # make sure only one 'best' match
 
         return cls(**transformer_configs[config[0]])
+
+    def to_dict(self):
+        data = asdict(self)  # Convert the dataclass to a dictionary
+        data["rope_scaling"] = (
+            json.dumps(self.rope_scaling) if self.rope_scaling else None
+        )
+        return data
 
 
 transformer_configs = {
@@ -129,6 +137,24 @@ transformer_configs = {
             "rope_type": "llama3",
         },
     ),
+    "Llama-3.2-3B-Instruct": dict(
+        block_size=131072,  # max_position_embeddings
+        n_layer=28,  # num_hidden_layers
+        n_head=24,  # num_attention_heads
+        n_local_heads=8,  # num_key_value_heads
+        dim=3072,  # hidden_size
+        intermediate_size=8192,  # intermediate_size
+        vocab_size=128256,  # vocab_size
+        rope_base=500000,  # rope_theta
+        max_length=131072,  # max_position_embeddings
+        rope_scaling={
+            "factor": 32.0,  # rope_scaling.factor
+            "low_freq_factor": 1.0,  # rope_scaling.low_freq_factor
+            "high_freq_factor": 4.0,  # rope_scaling.high_freq_factor
+            "original_max_position_embeddings": 8192,  # rope_scaling.original_max_position_embeddings
+            "rope_type": "llama3",  # rope_scaling.rope_type
+        },
+    ),
     "Qwen2-1.5B-Instruct": dict(
         block_size=32768,
         n_layer=28,
@@ -145,8 +171,8 @@ transformer_configs = {
     "Qwen2-0.5B-Instruct": dict(
         block_size=32768,
         n_layer=24,
-        n_head=14,
-        n_local_heads=2,
+        n_head=14,  # query
+        n_local_heads=2,  # key and value
         dim=896,
         intermediate_size=4864,
         vocab_size=151936,
@@ -188,6 +214,15 @@ class Transformer(nn.Module):
         # Fixed for now
         self.max_batch_size = 1
 
+        # Placeholder for lightweight model modules
+        self.kv_cache_lightweight_modules = {}  # Populated in self.setup_caches()
+        self.train_mode = False
+
+    def set_train_mode(self, mode: bool):
+        self.train_mode = mode
+        for layer in self.layers:
+            layer.attention.train_mode = mode
+
     def setup_caches(self, **kwargs):
         cache_strategy = kwargs.pop("cache_strategy")
 
@@ -199,6 +234,7 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
+
         for layer_idx, b in enumerate(self.layers):
             cache_constructor, relevant_kwargs = get_cache_constructor(
                 cache_strategy=cache_strategy[layer_idx]
@@ -220,8 +256,22 @@ class Transformer(nn.Module):
                 dtype,
                 **layer_kwargs,
             )
+            if cache_strategy[layer_idx] == "lightweight":
+                self.kv_cache_lightweight_modules[layer_idx] = (
+                    b.attention.kv_cache.models
+                )
+
+            # Check if the prompt compressor strategy is lightweight
+            prompt_comp_strategy = kwargs["prompt_compression_strategy"][layer_idx]
+            if prompt_comp_strategy == "lightweight":
+                # Add n_local_heads info to the layer_kwargs for the prompt compressor
+                layer_kwargs["n_heads"] = self.config.n_local_heads
+                layer_kwargs["dtype"] = dtype
+                layer_kwargs["head_dim"] = head_dim
+                layer_kwargs["config_dim"] = self.config.dim
+
             b.attention.prompt_compressor = get_prompt_compressor_constructor(
-                kwargs["prompt_compression_strategy"][layer_idx]
+                prompt_comp_strategy
             )(head_specific=b.attention.kv_cache.head_specific, **layer_kwargs)
 
         self.freqs_cis = precompute_freqs_cis(
@@ -265,6 +315,23 @@ class Transformer(nn.Module):
     def min_cache_length(self):
         return min([layer.attention.kv_cache.max_cache_length for layer in self.layers])
 
+    def get_lightweight_params(self) -> List[nn.Parameter]:
+        """
+        Retrieve parameters from all lightweight modules in the KV cache "lightweight".
+
+        This method iterates over each layer in the `kv_cache_lightweight_modules` dictionary
+        and aggregates the parameters from all the lightweight models associated with each layer.
+        These parameters can be used, for example, to set up an optimizer for fine-tuning only the
+        lightweight components of the cache.
+
+        Returns:
+            List[nn.Parameter]: A list containing all parameters from the lightweight modules.
+        """
+        params = []
+        for layer_idx, models in self.kv_cache_lightweight_modules.items():
+            params.extend(models.parameters())
+        return params
+
     def forward(
         self,
         idx: Tensor,
@@ -276,6 +343,7 @@ class Transformer(nn.Module):
         assert self.freqs_cis is not None, "Caches must be initialized first"
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
+        # TODO: convolution over embedding only once here, so to speak first layer only method
 
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -343,6 +411,7 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.train_mode = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -352,10 +421,10 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def compress_prompt(self, input_pos, k_val, v_val, attn):
+    def compress_prompt(self, input_pos, k_val, v_val, attn, **kwargs):
         seq_len = input_pos.shape[0]
         if self.kv_cache.max_cache_length < seq_len:
-            kwargs = {"attn": attn}
+            kwargs["attn"] = attn
             return self.prompt_compressor(input_pos, k_val, v_val, **kwargs)
 
         return input_pos, k_val, v_val, attn
@@ -373,6 +442,8 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
+
+        # x of shape (batch_size, 1, hidden_dim) in decoding mode, (batch_size, seqlen, hidden_dim) in prefill mode
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
@@ -385,9 +456,10 @@ class Attention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode, (batch_size, n_local_heads, 1, head_dim) in decoding mode
 
         kv_mask = None
-        cache_kwargs = {"input_ids": input_ids}
+        cache_kwargs = {"input_ids": input_ids, "x": x, "query": q}
         if not is_prefill:
             k, v, kv_mask = self.kv_cache.update_kv(
                 input_pos, k, v, is_prefill, **cache_kwargs
@@ -399,32 +471,81 @@ class Attention(nn.Module):
         k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v_rep = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        y, attn = scaled_dot_product_attention(
-            q,
-            k_rep,
-            v_rep,
-            attn_mask=kv_mask if mask is None else mask,
-            dropout_p=0.0,
-            attn_top_k=attn_top_k,
-            # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
-            return_attn=self.kv_cache.return_attn(),
-        )
+        with torch.no_grad():
+            y, attn = scaled_dot_product_attention(
+                q,
+                k_rep,
+                v_rep,
+                attn_mask=kv_mask if mask is None else mask,
+                dropout_p=0.0,
+                attn_top_k=attn_top_k,
+                # Ask the cache if needs attention scores returned (we cannot use FlexAttention if so)
+                return_attn=self.kv_cache.return_attn(),
+            )
 
-        if (
-            attn is not None
-        ):  # Mean pool over the grouped queries (average over self.n_head // self.n_local_heads)
-            attn = attn.view(
-                bsz, self.n_local_heads, self.n_head // self.n_local_heads, seqlen, -1
-            ).mean(dim=2)
+            if (
+                attn is not None
+            ):  # Mean pool over the grouped queries (average over self.n_head // self.n_local_heads)
+                attn = attn.view(
+                    bsz,
+                    self.n_local_heads,
+                    self.n_head // self.n_local_heads,
+                    seqlen,
+                    -1,
+                ).mean(dim=2)
 
         # Prefill updates happen after since we don't use the KV cache for prefill attention
         if is_prefill:
-            input_pos, k, v, attn = self.compress_prompt(input_pos, k, v, attn)
-            self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
+            with torch.no_grad():
+                if isinstance(self.kv_cache, KVCacheLightweight):
+                    cache_kwargs["feature_selection"] = self.kv_cache.feature_selection
+                    cache_kwargs["convolution_features"] = (
+                        self.kv_cache.convolution_features
+                    )
+            input_pos, k, v, attn = self.compress_prompt(
+                input_pos, k, v, attn, **cache_kwargs
+            )
+            with torch.no_grad():
+                self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
 
         # [Optional] Update the KV Cache internal state now that we have attention probabilities
         # This is a no-op for most cache classes
         self.kv_cache.update_state(input_pos, k, v, is_prefill, attn, **cache_kwargs)
+
+        # Call lightweight models to scale KV pairs
+        if (
+            self.train_mode
+            and is_prefill
+            and isinstance(self.kv_cache, KVCacheLightweight)
+        ):
+            # Compute scores using KVCacheLightweight
+            scores = self.kv_cache._token_importances(  # pylint: disable=W0212
+                input_pos
+            )  # try normalizing the scores
+            # Scale keys and values using the scores
+            # TODO: Implement entropy control of factors
+            scaling_factors = torch.sigmoid(scores).unsqueeze(
+                -1
+            )  # Shape: [n_heads, seq_len, 1]
+            # TODO: Try out different settings with key and / or value scaling
+            # k = k * scaling_factors
+            scaling_factors = scaling_factors[:, : v.size(2), :]
+            scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+
+            v_scaled = v * scaling_factors
+
+            # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v_rep = v_scaled.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+            y, attn = scaled_dot_product_attention(
+                q,
+                k_rep,
+                v_rep,
+                attn_mask=kv_mask if mask is None else mask,
+                dropout_p=0.0,
+                attn_top_k=attn_top_k,
+                return_attn=self.kv_cache.return_attn(),
+            )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 

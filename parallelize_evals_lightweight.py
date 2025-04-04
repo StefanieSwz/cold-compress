@@ -131,17 +131,15 @@ class GPUJobQueue:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run eval jobs for given yaml configs")
-    parser.add_argument(
-        "--command_file",
-        type=str,
-        help="text file consisting of commands (1 per line) to be run",
+    parser = argparse.ArgumentParser(
+        description="Run eval jobs for given lightweight model version"
     )
     parser.add_argument(
-        "--config_names",
+        "--lightweight_model_versions",
+        type=str,
         nargs="+",
-        help="YAML configuration files that need to be evaluated",
-        required="--command_file" not in sys.argv,
+        required=True,
+        help="List of lightweight model versions to be evaluated.",
     )
     parser.add_argument(
         "--tasks",
@@ -159,30 +157,10 @@ if __name__ == "__main__":
         help="Cache sizes to be evaluated.",
     )
     parser.add_argument(
-        "--min_recovery_fractions",
-        type=float,
-        nargs="+",
-        default=[0.75, 0.6, 0.5, 0.25, 0.1],
-        help="FastGen only: the compression is decided based on min recovery fraction.",
-    )
-    parser.add_argument(
         "--num_samples",
         type=int,
         default=-1,
         help="Number of examples to sample for evaluation. Defaults to None, which uses the full dataset.",
-    )
-    parser.add_argument(
-        "--add_full",
-        default=False,
-        action="store_true",
-        help="Run the full attention model in addition to the compressed models.",
-    )
-    parser.add_argument(
-        "--checkpoint_path",
-        type=Path,
-        default=Path(__file__).resolve().parent
-        / "checkpoints/meta-llama/Meta-Llama-3-8B-Instruct/model.pth",
-        help="Model checkpoint path.",
     )
     parser.add_argument(
         "--num_gpus", type=int, default=8, help="Number of GPUs available"
@@ -194,68 +172,21 @@ if __name__ == "__main__":
 
     gpu_queue = GPUJobQueue(num_gpus=args.num_gpus, log_dir=args.log_dir)
 
-    if args.command_file:
-        with open(args.command_file) as fin:
-            lines = [line.strip() for line in fin]
-        for line in lines:
-            if line:
-                gpu_queue.add_job(line)
+    base_command = "python eval.py --task {task} --cache_strategy lightweight --prompt_compression_strategy lightweight --lightweight_model_version {version} --global_tokens 4 --recent_window 10 --num_samples {ns}  --max_cache_length {cs} --use_wandb"  # --compile
 
-    else:
-        configs = []
-        for config in args.config_names:
-            if not config.endswith(".yaml"):
-                config = config + ".yaml"
-            assert os.path.join(
-                os.path.abspath(__file__), "cache_configs", config
-            ), f"{config} not found in cache_configs"
-            configs.append(config)
-
-        base_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns}  --max_cache_length {cs} --use_wandb"  # --compile
-
-        fastgen_command = "python eval.py --task {task} --checkpoint {chkpt} --cache_config {config} --num_samples {ns}  --min_recovery_frac {rf} --use_wandb"  # --compile
-
-        # Create tasks and add them to the task queue.
-        tasks = list(itertools.product(args.tasks, args.cache_sizes, configs))
-        for task, cs, config in itertools.product(
-            args.tasks, args.cache_sizes, configs
-        ):
-            if config != "fastgen.yaml":
-                gpu_queue.add_job(
-                    base_command.format(
-                        task=task,
-                        chkpt=args.checkpoint_path,
-                        config=config,
-                        ns=args.num_samples,
-                        cs=cs,
-                    )
-                )
-
-        for task, rf, config in itertools.product(
-            args.tasks, args.min_recovery_fractions, configs
-        ):
-            if config == "fastgen.yaml":
-                gpu_queue.add_job(
-                    fastgen_command.format(
-                        task=task,
-                        chkpt=args.checkpoint_path,
-                        config=config,
-                        ns=args.num_samples,
-                        rf=rf,
-                    )
-                )
-
-        if args.add_full:
-            for task in args.tasks:
-                gpu_queue.add_job(
-                    base_command.format(
-                        task=task,
-                        chkpt=args.checkpoint_path,
-                        config="full.yaml",
-                        ns=args.num_samples,
-                        cs=1.0,
-                    )
-                )
+    # Create tasks and add them to the task queue.
+    # tasks = list(itertools.product(args.tasks, args.cache_sizes, args.lightweight_model_versions))
+    for task, cs, version in itertools.product(
+        args.tasks, args.cache_sizes, args.lightweight_model_versions
+    ):
+        gpu_queue.add_job(
+            base_command.format(
+                task=task,
+                version=version,
+                ns=args.num_samples,
+                cs=cs,
+            )
+        )
 
     print(f"Adding {gpu_queue.job_queue.qsize()} tasks into the job queue")
 

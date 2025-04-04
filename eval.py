@@ -4,27 +4,36 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import sys
+import os
 import time
 import argparse
 import math
 import json
-import regex as re
 import contextlib
-import shutil
-import itertools
-import pandas as pd
-import numpy as np
 from pathlib import Path
 from typing import Optional, List
 from collections import defaultdict, Counter
+import shutil
+import itertools
+import tempfile
+
+import regex as re
+import pandas as pd
+import numpy as np
 from tqdm.auto import tqdm
+from dotenv import load_dotenv
+import wandb
 
 import torch
 import torch._dynamo.config
 import torch._inductor.config
 
-from cache import add_cache_arguments, cache_compatibility, get_cache_constructor
-from model import Transformer
+from cache import (
+    add_cache_arguments,
+    cache_compatibility,
+    get_cache_constructor,
+)
+from model import Transformer, ModelArgs
 from generation_utils import (
     add_generation_arguments,
     compile_funcs,
@@ -57,6 +66,8 @@ sys.path.append(str(wd))
 from tokenizer import get_tokenizer
 from generation_utils import load_model, generate
 from task import TASK_MAPPING, AutoTask
+
+load_dotenv()
 
 
 def flatten_dict(in_dict: dict) -> dict:
@@ -121,9 +132,12 @@ def args_to_str(args):
         "__".join(
             sorted(
                 [
-                    f"{k}=" + ",".join(compress_list([str(process_num(m)) for m in v]))
-                    if type(v) == list
-                    else f"{k}={process_num(v)}"
+                    (
+                        f"{k}="
+                        + ",".join(compress_list([str(process_num(m)) for m in v]))
+                        if type(v) == list
+                        else f"{k}={process_num(v)}"
+                    )
                     for k, v in args_dict.items()
                     if k in RELEVANT_CACHE_KWARGS
                 ]
@@ -131,6 +145,21 @@ def args_to_str(args):
         )
         + debug_suffix
     )
+
+
+def serialize_value(v):
+    """Convert non-serializable objects to JSON-compatible types."""
+    if isinstance(v, Path):
+        return str(v)  # Convert Path to string
+    elif isinstance(v, torch.Tensor):
+        return v.tolist()  # Convert Tensor to list
+    elif isinstance(v, argparse.Namespace):
+        return vars(v)  # Convert Namespace to dict
+    elif isinstance(v, set):
+        return list(v)  # Convert set to list
+    elif isinstance(v, ModelArgs):
+        return v.to_dict()
+    return v  # Keep other values as they are
 
 
 def run_task(
@@ -323,6 +352,83 @@ def main(
     out_dir: Path = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer."""
+
+    global print
+    from tp import maybe_init_dist
+
+    if args.use_wandb:
+        # Init wandb
+        wandb_api_key = os.getenv("WANDB_API_KEY")
+        wandb_project = os.getenv("WANDB_PROJECT")
+        wandb_entity = os.getenv("WANDB_ENTITY")
+        wandb_account = os.getenv("WANDB_ACCOUNT")
+        wandb_model_registry = os.getenv("WANDB_MODEL_REGISTRY")
+
+        # Validate that all required environment variables are present
+        if not wandb_api_key:
+            raise ValueError("WANDB_API_KEY environment variable is not set.")
+        if not wandb_project:
+            raise ValueError("WANDB_PROJECT environment variable is not set.")
+        if not wandb_entity:
+            raise ValueError("WANDB_ENTITY environment variable is not set.")
+        if not wandb_account:
+            raise ValueError("WANDB_ACCOUNT environment variable is not set.")
+        if not wandb_model_registry:
+            raise ValueError("WANDB_MODEL_REGISTRY environment variable is not set.")
+
+        wandb.login(key=wandb_api_key)
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            config=vars(args),
+            group="evaluation",
+        )
+        # registry_path = f"{wandb_account}/wandb-registry-model/{wandb_model_registry}"
+        # execute eval directly after training
+        if isinstance(cache_kwargs["cache_strategy"], str):
+            cache_strategy_list = [cache_kwargs["cache_strategy"]]
+        else:
+            cache_strategy_list = cache_kwargs["cache_strategy"]
+        if isinstance(cache_kwargs["prompt_compression_strategy"], str):
+            prompt_strategy_list = [cache_kwargs["prompt_compression_strategy"]]
+        else:
+            prompt_strategy_list = cache_kwargs["prompt_compression_strategy"]
+        if (
+            "lightweight" in cache_strategy_list
+            or "lightweight" in prompt_strategy_list
+        ):
+            model_ref = "lightweight_model:" + args.lightweight_model_version
+            model_artifact = wandb.use_artifact(model_ref, type="model")
+            print("Artifact contents:", model_artifact.file())
+            temp_dir_obj = (
+                tempfile.TemporaryDirectory()
+            )  # Keep reference, don't use `with`
+            temp_dir = temp_dir_obj.name  # Get the path
+            model_artifact.download(root=temp_dir)  # Download to a temp directory
+            model_path = os.path.join(temp_dir, "model.pth")
+            cache_kwargs["trained_weights"] = model_path
+            print(f"Using lightweight model from {model_path}")
+            # get configs
+            run_config = model_artifact.logged_by().config
+
+            print("Metadata associated with model version:")
+            checkpoint_path = Path(run_config.get("checkpoint_path"))
+            print(f"Checkpoint path: {checkpoint_path}")
+            cache_kwargs["model_type"] = run_config.get("model_type", None)
+            cache_kwargs["vector_convolution"] = run_config.get(
+                "vector_convolution", None
+            )
+            cache_kwargs["feature_selection"] = run_config.get(
+                "feature_selection", None
+            )
+            cache_kwargs["convolution_features"] = run_config.get(
+                "convolution_features", None
+            )
+            print(f"Model type: {cache_kwargs['model_type']}")
+            print(f"Vector convolution: {cache_kwargs['vector_convolution']}")
+            print(f"Feature selection: {cache_kwargs['feature_selection']}")
+            print(f"Convolution features: {cache_kwargs['convolution_features']}")
+
     assert checkpoint_path.is_file(), checkpoint_path
 
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
@@ -330,9 +436,6 @@ def main(
         # If there's no tokenizer.model, try to load the tokenizer from the parent directory
         # NOTE: We assume the tokenizer in the parent directory is compatible with huggingface transformers
         tokenizer_path = checkpoint_path.parent
-
-    global print
-    from tp import maybe_init_dist
 
     rank = maybe_init_dist()
     use_tp = rank is not None
@@ -357,7 +460,10 @@ def main(
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path, is_chat=is_chat)
 
-    if cache_kwargs["cache_strategy"] == "hybrid":
+    if (
+        cache_kwargs["cache_strategy"] == "hybrid"
+        or cache_kwargs["cache_strategy"] == "lightweight"
+    ):
         # We need to pass the special and punctuation token ids to the cache via cache_kwargs
         cache_kwargs["token_ids"] = {
             "special": tokenizer.special_ids(),
@@ -428,28 +534,65 @@ def main(
             with open(task_args_out_fn, "w") as fd:
                 print(f"Saving dynamic args for {task_name} to {task_args_out_fn}")
                 # Convert Path objects to strings
-                task_args_json = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in task_args.items()
-                }
+                task_args_json = {k: serialize_value(v) for k, v in task_args.items()}
                 json.dump(task_args_json, fd, indent=4)
+
+            if args.use_wandb:
+                metadata = {
+                    "tasks": task_name,
+                    "model_checkpoint": str(checkpoint_path),
+                    "cache_strategy": str(cache_strategy_list[0]),
+                }
+                if "model_artifact" in locals():
+                    metadata["features"] = model_artifact.metadata.get("feature_selection", None)
+            
+                # Create artifact with the correct metadata
+                artifact = wandb.Artifact(
+                    name="evaluation_results",
+                    type="evaluation",
+                    metadata=metadata,
+                )
+
+
+                # Add general result files
+                if args_fn.exists():
+                    artifact.add_file(str(args_fn))  # Save args
+                if all_out_fn.exists():
+                    artifact.add_file(str(all_out_fn))  # Save all metrics
+
+                # Add each task's results
+                if task_out_fn.exists():
+                    artifact.add_file(str(task_out_fn))
+                if task_args_out_fn.exists():
+                    artifact.add_file(str(task_args_out_fn))
+                if pred_out_fn.exists():
+                    artifact.add_file(str(pred_out_fn))
+
+                # Log to W&B
+                wandb.log_artifact(artifact)
+                print("✅ W&B Artifact saved with all evaluation results.")
 
         if not args_fn.exists():
             # Only save args once and only save if we've gotten through a full eval and are ready to dump metrics
             with open(args_fn, "w") as fd:
                 # Convert Path objects to strings
                 cache_kwargs_json = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in cache_kwargs.items()
+                    k: serialize_value(v) for k, v in cache_kwargs.items()
                 }
                 json.dump(cache_kwargs_json, fd, indent=4)
 
     with open(all_out_fn, "w") as fd:
         json.dump(task_metrics, fd, indent=4)
 
+    if args.use_wandb:
+        if cache_kwargs["cache_strategy"] == "lightweight":
+            temp_dir_obj.cleanup()
+        wandb.finish()
+
 
 def setup(args) -> Path:
-    sub_dir = args_to_str(args) if args.out_dir is None else args.out_dir
+    # sub_dir = args_to_str(args) if args.out_dir is None else args.out_dir
+    sub_dir = time.strftime("%Y%m%d_%H%M%S")
     out_dir = (
         Path(__file__).parent
         / "results"
@@ -533,6 +676,20 @@ def add_eval_args(parser):
         default=False,
         action="store_true",
         help="If True will truncate cache after prefill and then decode the first token.",
+    )
+
+    parser.add_argument(
+        "--use_wandb",
+        default=False,
+        action="store_true",
+        help="If weights and biases should be used during evaluation for loading the lightweight model or saving the eval results as artifacts.",
+    )
+
+    parser.add_argument(
+        "--lightweight_model_version",
+        type=str,
+        default="latest",
+        help="Version of the lightweight model to use.",
     )
 
 

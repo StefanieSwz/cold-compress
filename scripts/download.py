@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 import os
 from typing import Optional
+from dotenv import load_dotenv
 
 from requests.exceptions import HTTPError
 
@@ -52,4 +53,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.hf_token is None:
+        load_dotenv()
+        parser.hf_token = os.getenv("HF_TOKEN")
+
     hf_download(args.repo_id, args.hf_token)

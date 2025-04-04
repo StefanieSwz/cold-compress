@@ -1,14 +1,18 @@
 import random
+from typing import Any, Dict, List, Optional, Union
 from abc import ABC, abstractmethod
 from string import ascii_uppercase
 from pathlib import Path
+import logging
 
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 
 from metric import AutoMetric
 from tokenizer import get_tokenizer
+
+logging.basicConfig(level=logging.INFO)
 
 
 class EvaluationTask(ABC):
@@ -93,8 +97,8 @@ class EvaluationTask(ABC):
 
     def compute_metrics(self, predictions, split, dataset):
         assert self.is_ready[split], f"Split {split} has not been processed yet."
-        assert (
-            len(dataset) == len(predictions)
+        assert len(dataset) == len(
+            predictions
         ), f"Number of predictions and labels must match ({len(predictions)} != {len(dataset)})."
         return self._compute_metrics(dataset["prompt"], predictions, dataset["labels"])
 
@@ -755,6 +759,279 @@ NOTE: You should only predict the next line in the current file. Do not produce 
         }
 
 
+class UltraChat(EvaluationTask):
+    """
+    UltraChatTask is an evaluation task for chat-based dialogue generation.
+
+    This task takes a chat dialog as input and creates training examples for generating a response.
+    Each training example includes the conversation history up to an assistant response and uses that
+    response as the target label.
+
+    Attributes:
+        DEFAULT_PROMPT_TEMPLATE (str): The default prompt template with chat history and response markers.
+        RAW_PROMPT_TEMPLATE (str): A raw prompt template for cases where only the chat history is needed.
+        train_split (str): Dataset split used for training.
+        validation_split (str): Dataset split used for validation.
+        test_split (str): Dataset split used for testing.
+        metrics (Dict[str, Any]): Dictionary mapping metric names to their corresponding evaluation objects.
+    """
+
+    RAW_PROMPT_TEMPLATE = """{chat_history}"""
+    train_split: str = "train_gen"
+    validation_split: str = "val_gen"  # not originally in HF dataset
+    test_split: str = "test_gen"
+
+    def __init__(
+        self,
+        prompt_template: str = RAW_PROMPT_TEMPLATE,
+        max_tokens: int = 512,
+        tokenizer: Optional[Any] = None,  # pylint: disable=W0621
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the UltraChatTask.
+
+        This sets up the task by specifying the prompt template, maximum tokens for generation,
+        tokenizer, and additional arguments. It also sets up the evaluation metrics using AutoMetric.
+
+        Args:
+            prompt_template (str, optional): The prompt template to use. Defaults to RAW_PROMPT_TEMPLATE.
+            max_tokens (int, optional): Maximum number of tokens for generation. Defaults to 512.
+            tokenizer (Optional[Any], optional): The tokenizer to use. Defaults to None.
+            **kwargs (Any): Additional keyword arguments. Expected to include at least:
+                - "hf_args": List of arguments for loading the Hugging Face dataset.
+                - "model_type": A string specifying the lightweight model type.
+                - "trained_weights": (Optional) Path to pretrained weights.
+        """
+        super().__init__(
+            prompt_template,
+            max_tokens,
+            tokenizer=tokenizer,
+            hf_args=["HuggingFaceH4/ultrachat_200k"],
+            **kwargs,
+        )
+
+        self.metrics = {
+            "BertScore": AutoMetric.from_name("bertscore"),
+            "Rouge": AutoMetric.from_name("rouge"),
+            # "LLM-Rouge": AutoMetric.from_name(
+            #     "llm-rouge"
+            # ),  # antropic AI very slow, optional
+            # "LLM-Judge": AutoMetric.from_name(
+            #     "llm-as-a-judge"
+            # ),  # antropic AI very slow, optional
+        }
+
+    def get_split(self, split: str) -> Union[Dataset, Any]:
+        """
+        Retrieve and preprocess the dataset split.
+
+        This method selects the appropriate split from the dataset, optionally performs a train-validation split,
+        applies the prepare_batch transformation, filters examples that are too long, and (if needed) samples a subset.
+
+        Args:
+            split (str): The dataset split to retrieve (e.g., "train_gen", "val_gen", "test_gen").
+
+        Returns:
+            Union[Dataset, Any]: The preprocessed dataset split.
+        """
+        remove_cols = [
+            col
+            for col in self.dataset[split].column_names
+            if col not in self.mandatory_cols
+        ]
+        split_name = split
+        if split == "val_gen":
+            split_name = "train_gen"
+        if not self.is_ready[split_name]:
+            split_data = self.dataset[split_name]
+            # if split == "test_gen":
+            #     split_data = split_data.select(
+            #         range(min(len(split_data), EVAL_LENGTH))
+            #     )  # Limit to EVAL_LENGTH rows for now in evaluation
+
+            if split != "test_gen":  # Train-validation split logic
+                # TODO: Implement a proper train-validation split with seed and parameter setting
+                total_size = len(split_data)
+
+                train_size = int(0.7 * total_size)
+                train_indices = list(range(train_size))
+                val_indices = list(range(train_size, total_size))
+
+                if split == "train_gen":
+                    split_data = split_data.select(train_indices)
+                else:
+                    split_data = split_data.select(val_indices)
+
+            split_data = split_data.map(
+                self.prepare_batch, batched=True, remove_columns=remove_cols
+            )
+
+            # Filter out examples that could be too long for the model
+            filtered_data = split_data.filter(
+                lambda x: len(self.tokenizer(x["prompt"])) + self.max_tokens
+                <= self.model_max_length
+            )
+            print(
+                f"Filtered {len(split_data) - len(filtered_data)} examples from split {split}"
+            )
+
+            if self.num_samples > 0 and len(filtered_data) > self.num_samples:
+                n = min(self.num_samples, len(filtered_data))
+                print(f"Randomly sample {n} examples")
+                # Use a fixed seed for reproducibility, set in eval.py 375
+                inds = random.Random(n).sample(range(len(filtered_data)), n)
+                filtered_data = filtered_data.select(inds)
+
+            self.dataset[split] = filtered_data
+            self.is_ready[split] = True
+
+        return self.dataset[split]
+
+    def prepare_row(self, row: Dict[str, Any]) -> List[Dict[str, Optional[str]]]:
+        """
+        Processes a single chat row to create multiple training examples.
+
+        Each training example corresponds to an assistant response within the conversation.
+        The prompt is constructed using all previous messages (i.e. the conversation history up to,
+        but not including, the current assistant response), which is used both as the prompt and context.
+        The assistant's response is then used as the label.
+
+        Args:
+            row (Dict[str, Any]): A dictionary representing a chat conversation. It must contain the key
+                "messages", where the value is a list of message dictionaries. Each message dictionary
+                should have at least the keys "role" and "content", where "role" is a string indicating
+                the speaker (e.g., "user" or "assistant") and "content" is the text content.
+
+        Returns:
+            List[Dict[str, Optional[str]]]: A list of training example dictionaries. Each dictionary contains:
+                - "prompt": A string containing the conversation history (excluding the current assistant response).
+                - "context": The same string as the prompt.
+                - "question": Always None, as there is no explicit question.
+                - "labels": The assistant's response text corresponding to that point in the conversation.
+        """
+        messages = row["messages"]
+        chat_history = []
+        processed_examples = []
+
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+            chat_history.append(f"{role.capitalize()}: {content}")
+
+            if role == "assistant":
+                prompt = self.prompt_template.format(
+                    chat_history="\n".join(chat_history[:-1])
+                )
+
+                processed_examples.append(
+                    {
+                        "prompt": prompt,
+                        "context": prompt,
+                        "question": None,
+                        "labels": content,
+                    }
+                )
+
+        return processed_examples
+
+
+class GSM8k(EvaluationTask):
+    """
+    Evaluation task for GSM8k: Grade School Math with 8k context length.
+
+    The GSM8k benchmark consists of math word problems that test chain-of-thought
+    reasoning abilities. Each instance requires multi-step reasoning to arrive at
+    the correct answer.
+
+    This class is designed to evaluate model performance on such problems, using
+    prompts and outputs tailored for long-context (8k token) evaluation settings.
+    """
+
+    RAW_PROMPT_TEMPLATE = """Q: {question}\nA:"""
+
+    def __init__(
+        self,
+        prompt_template: str = RAW_PROMPT_TEMPLATE,
+        max_tokens: int = 512,
+        tokenizer: Optional[Any] = None,  # pylint: disable=W0621
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            prompt_template,
+            max_tokens,
+            tokenizer=tokenizer,
+            hf_args=["openai/gsm8k", "main"],
+            **kwargs,
+        )
+
+        self.metrics = {
+            "BertScore": AutoMetric.from_name("bertscore"),
+            "Rouge": AutoMetric.from_name("rouge"),
+            # "LLM-Rouge-Llama": AutoMetric.from_name("llm-rouge-llama"),
+            # "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
+        }
+
+    def prepare_row(self, row):
+        prompt = self.prompt_template.format(question=row["question"])
+        return {
+            "question": row["question"],
+            "prompt": prompt,
+            "labels": row["answer"].strip(),
+        }
+
+
+class CNNDailyMailTask(EvaluationTask):
+    """
+    Evaluation task for the CNN/DailyMail summarization dataset.
+
+    This task evaluates a model's ability to generate concise and informative
+    summaries of news articles. The dataset consists of article-summary pairs
+    from CNN and Daily Mail, making it a standard benchmark for abstractive
+    summarization in NLP.
+    """
+
+    RAW_PROMPT_TEMPLATE = """You will be shown a news article. Your task is to summarize the article.
+
+====ARTICLE====
+{article}
+
+====SUMMARY====
+"""
+
+    def __init__(
+        self,
+        prompt_template: str = RAW_PROMPT_TEMPLATE,
+        max_tokens: int = 512,
+        tokenizer: Optional[Any] = None,  # pylint: disable=W0621
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            prompt_template,
+            max_tokens,
+            tokenizer=tokenizer,
+            hf_args=["abisee/cnn_dailymail", "3.0.0"],
+            **kwargs,
+        )
+
+        self.metrics = {
+            "BertScore": AutoMetric.from_name("bertscore"),
+            "Rouge": AutoMetric.from_name("rouge"),
+            # "LLM-Rouge": AutoMetric.from_name(
+            #     "llm-rouge"
+            # ),  # antropic AI very slow, optional
+            # "LLM-Judge-Llama": AutoMetric.from_name("llm-as-a-judge-llama"),
+        }
+
+    def prepare_row(self, row):
+        prompt = self.prompt_template.format(article=row["article"])
+        return {
+            "context": row["article"],
+            "prompt": prompt,
+            "labels": row["highlights"].strip(),
+        }
+
+
 TASK_MAPPING = {
     "dolomites": Dolomites,
     "musique": Musique,
@@ -769,6 +1046,9 @@ TASK_MAPPING = {
     "squality": Squality,
     "triviaqa": TriviaQA,
     "truthfulqa": TruthfulQA,
+    "ultrachat": UltraChat,
+    "gsm8k": GSM8k,
+    "dailymail": CNNDailyMailTask,
 }
 
 
