@@ -30,6 +30,9 @@ torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
 # support running without installing as a package
+print("BEFORE anything:")
+print("torch.cuda.is_available():", torch.cuda.is_available())
+print("device count:", torch.cuda.device_count())
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.append(str(PROJECT_ROOT))
 
@@ -449,7 +452,14 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("CUDA available:", torch.cuda.is_available())
+    print("Current device:", torch.cuda.current_device())
+    assert (
+        torch.cuda.is_available()
+    ), "CUDA not available — check container and job config."
+    device = "cuda"
+
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device={device}")
     # distributed training
     rank = maybe_init_dist()
