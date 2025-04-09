@@ -522,9 +522,15 @@ class Attention(nn.Module):
             scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos
             )  # try normalizing the scores
+
+            # Min-max normalization
+            min_vals = scores.min(dim=-1, keepdim=True).values
+            max_vals = scores.max(dim=-1, keepdim=True).values
+            normalized_scores = (scores - min_vals) / (max_vals - min_vals)
+
             # Scale keys and values using the scores
             # TODO: Implement entropy control of factors
-            scaling_factors = torch.sigmoid(scores).unsqueeze(
+            scaling_factors = torch.sigmoid(normalized_scores).unsqueeze(
                 -1
             )  # Shape: [n_heads, seq_len, 1]
             # TODO: Try out different settings with key and / or value scaling
