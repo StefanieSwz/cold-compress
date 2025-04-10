@@ -412,6 +412,7 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self.train_mode = False
+        self.normalization = True
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -522,17 +523,36 @@ class Attention(nn.Module):
             scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos
             )  # try normalizing the scores
+            if self.normalization:
+                invalid_mask = torch.isinf(scores)
+                # Compute per-head min and max ignoring -inf
+                min_val = (
+                    torch.where(invalid_mask, float("inf"), scores)
+                    .min(dim=-1, keepdim=True)
+                    .values
+                )
+                max_val = (
+                    torch.where(invalid_mask, float("-inf"), scores)
+                    .max(dim=-1, keepdim=True)
+                    .values
+                )
 
-            # Min-max normalization
-            min_vals = scores.min(dim=-1, keepdim=True).values
-            max_vals = scores.max(dim=-1, keepdim=True).values
-            normalized_scores = (scores - min_vals) / (max_vals - min_vals)
+                # Fill infs with 0 after computing min/max
+                scores = scores.masked_fill(invalid_mask, 0.0)
 
-            # Scale keys and values using the scores
-            # TODO: Implement entropy control of factors
-            scaling_factors = torch.sigmoid(normalized_scores).unsqueeze(
-                -1
-            )  # Shape: [n_heads, seq_len, 1]
+                # Normalize
+                normalized_scores = (scores - min_val) / (max_val - min_val).clamp(
+                    min=1e-4
+                )
+                # Scale keys and values using the scores
+                # TODO: Implement entropy control of factors
+                scaling_factors = torch.sigmoid(normalized_scores * 10 - 5).unsqueeze(
+                    -1
+                )  # Shape: [n_heads, seq_len, 1]
+            else:
+                scaling_factors = torch.sigmoid(scores).unsqueeze(
+                    -1
+                )  # Shape: [n_heads, seq_len, 1]
             # TODO: Try out different settings with key and / or value scaling
             # k = k * scaling_factors
             scaling_factors = scaling_factors[:, : v.size(2), :]
