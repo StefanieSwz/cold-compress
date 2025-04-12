@@ -7,6 +7,7 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 from typing import Optional, Dict, Any, List
 import json
+import pdb
 
 import math
 import torch
@@ -412,7 +413,8 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self.train_mode = False
-        self.normalization = True
+        self.normalization = False
+        self.use_softmax = True
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -541,14 +543,17 @@ class Attention(nn.Module):
                 scores = scores.masked_fill(invalid_mask, 0.0)
 
                 # Normalize
-                normalized_scores = (scores - min_val) / (max_val - min_val).clamp(
+                scores = (scores - min_val) / (max_val - min_val).clamp(
                     min=1e-4
-                )
-                # Scale keys and values using the scores
-                # TODO: Implement entropy control of factors
-                scaling_factors = torch.sigmoid(normalized_scores * 10 - 5).unsqueeze(
+                ) * 10 - 5
+
+            # TODO: Implement entropy control of factors
+            if self.use_softmax:
+                temperature = 1.2
+                scaling_factors = F.softmax(scores / temperature, dim=-1).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
+                # Scale keys and values using the scores
             else:
                 scaling_factors = torch.sigmoid(scores).unsqueeze(
                     -1
@@ -563,7 +568,7 @@ class Attention(nn.Module):
             # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
             v_rep = v_scaled.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-            y, attn = scaled_dot_product_attention(
+            attn_output, attn = scaled_dot_product_attention(
                 q,
                 k_rep,
                 v_rep,
@@ -571,6 +576,15 @@ class Attention(nn.Module):
                 dropout_p=0.0,
                 attn_top_k=attn_top_k,
                 return_attn=self.kv_cache.return_attn(),
+            )
+
+            # Combine attention output and bypass
+            gate = 0.1  # fixed value, maybe train correct gate value
+            y_combined = attn_output + gate * v_rep  # both [B, heads, seq, dim]
+            y = (
+                y
+                * attn_output.norm(dim=-1, keepdim=True)
+                / y_combined.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)

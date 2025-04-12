@@ -729,7 +729,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         if "attn_score" in kwargs["feature_selection"]:
             self.register_buffer("attn_score", torch.zeros(score_shape, dtype=dtype))
             self.feature_space_dim += 1
-            print("Attn score feature initialized")
+
         if "vector_norm" in kwargs["feature_selection"]:
             self.register_buffer("key_norm", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("value_norm", torch.zeros(score_shape, dtype=dtype))
@@ -738,21 +738,21 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 "embedding_norm", torch.zeros(score_shape, dtype=dtype)
             )
             self.feature_space_dim += 4
-            print("Vector norm feature initialized")
+
         if "vector_cv" in kwargs["feature_selection"]:
             self.register_buffer("key_cv", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("value_cv", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("query_cv", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("embedding_cv", torch.zeros(score_shape, dtype=dtype))
             self.feature_space_dim += 4
-            print("Vector cv feature initialized")
+
         if "vector_z_score" in kwargs["feature_selection"]:
             self.register_buffer("key_z", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("value_z", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("query_z", torch.zeros(score_shape, dtype=dtype))
             self.register_buffer("embedding_z", torch.zeros(score_shape, dtype=dtype))
             self.feature_space_dim += 4
-            print("Vector z-score feature initialized")
+
         if "token_profiling" in kwargs["feature_selection"]:
             special_ids_tensor = torch.tensor(
                 kwargs["token_ids"]["special"], dtype=torch.int32
@@ -770,7 +770,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 "token_punctuation_profiling", torch.zeros(score_shape, dtype=dtype)
             )
             self.feature_space_dim += 2
-            print("Token profiling feature initialized")
+
         if "convolution" in kwargs["feature_selection"]:
             self.conv_layers = nn.ModuleDict()
 
@@ -842,13 +842,10 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                     self.feature_space_dim += result_conv_dim
                 else:
                     print("No convolution feature initialized")
-                print(
-                    f"Convolution feature {feat} initialized with {result_conv_dim} feature values."
-                )
         if "normalized_pos" in kwargs["feature_selection"]:
             # no buffer needed as computed directly in token_importance
             self.feature_space_dim += 1
-            print("Normalized position feature initialized")
+
         # Initialize lightweight models for computing token scores.
         if kwargs["model_type"] == "linear":
             self.models = nn.ModuleList(
