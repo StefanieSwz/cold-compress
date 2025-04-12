@@ -419,7 +419,7 @@ class Attention(nn.Module):
         self.normalization = False
         self.use_softmax = True
         self.use_gate = False
-        self.use_value_scoring = False
+        self.use_value_scoring = True
         self.use_attention_bias = True
         self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -528,48 +528,60 @@ class Attention(nn.Module):
             and isinstance(self.kv_cache, KVCacheLightweight)
         ):
             # Compute scores using KVCacheLightweight
-            scores = self.kv_cache._token_importances(  # pylint: disable=W0212
+            raw_scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos
             )  # try normalizing the scores
             if self.normalization:
-                invalid_mask = torch.isinf(scores)
+                invalid_mask = torch.isinf(raw_scores)
                 # Compute per-head min and max ignoring -inf
                 min_val = (
-                    torch.where(invalid_mask, float("inf"), scores)
+                    torch.where(invalid_mask, float("inf"), raw_scores)
                     .min(dim=-1, keepdim=True)
                     .values
                 )
                 max_val = (
-                    torch.where(invalid_mask, float("-inf"), scores)
+                    torch.where(invalid_mask, float("-inf"), raw_scores)
                     .max(dim=-1, keepdim=True)
                     .values
                 )
 
                 # Fill infs with 0 after computing min/max
-                scores = scores.masked_fill(invalid_mask, 0.0)
+                raw_scores = raw_scores.masked_fill(invalid_mask, 0.0)
 
                 # Normalize
-                scores = (scores - min_val) / (max_val - min_val).clamp(
+                raw_scores = (raw_scores - min_val) / (max_val - min_val).clamp(
                     min=1e-4
                 ) * 10 - 5
 
             # TODO: Implement entropy control of factors
             if self.use_softmax:
                 temperature = 1.2
-                scaling_factors = F.softmax(scores / temperature, dim=-1).unsqueeze(
+                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
                 # Scale keys and values using the scores
             else:
-                scaling_factors = torch.sigmoid(scores).unsqueeze(
+                scores = torch.sigmoid(raw_scores).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
             # TODO: Try out different settings with key and / or value scaling
             # k = k * scaling_factors
-            if self.use_value_scoring:
-                scaling_factors = scaling_factors[:, : v.size(2), :]
-                scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+            # Truncate to valid sequence length
+            S = k.size(-2)
+            scores = scores[:, :S]  # truncate invalid tail positions
 
+            # For value scaling — only needs to match [B, n_local_heads, S, 1]
+            scaling_factors = scores.unsqueeze(0)  # [1, n_local_heads, S, 1]
+
+            # For attention bias — operates on query side → [1, n_heads, 1, S]
+            importance_scores = (
+                scores.repeat_interleave(self.n_head // self.n_local_heads, dim=0)
+                .unsqueeze(0)
+                .unsqueeze(2)
+                .squeeze(-1)
+            )
+
+            if self.use_value_scoring:
                 v_scaled = v * scaling_factors
 
                 # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
@@ -597,16 +609,6 @@ class Attention(nn.Module):
                     / y_combined.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 )
             if self.use_attention_bias:
-                S = k.size(-2)
-                importance_scores = (
-                    scaling_factors[:, :S, :]  # truncate to actual sequence length
-                    .squeeze(-1)  # [n_local_heads, S]
-                    .repeat_interleave(
-                        self.n_head // self.n_local_heads, dim=0
-                    )  # [n_heads, S]
-                    .unsqueeze(0)  # [1, n_heads, S]
-                    .unsqueeze(2)  # [1, n_heads, 1, S] -> ready to add to attn_weight
-                )
                 y, attn = scaled_dot_product_attention_biased(
                     q,
                     k_rep,
