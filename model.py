@@ -15,7 +15,10 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
-from attention_utils import scaled_dot_product_attention
+from attention_utils import (
+    scaled_dot_product_attention,
+    scaled_dot_product_attention_biased,
+)
 from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
 
@@ -415,6 +418,9 @@ class Attention(nn.Module):
         self.train_mode = False
         self.normalization = False
         self.use_softmax = True
+        self.use_gate = False
+        self.use_value_scoring = False
+        self.use_attention_bias = True
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -560,32 +566,57 @@ class Attention(nn.Module):
                 )  # Shape: [n_heads, seq_len, 1]
             # TODO: Try out different settings with key and / or value scaling
             # k = k * scaling_factors
-            scaling_factors = scaling_factors[:, : v.size(2), :]
-            scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+            if self.use_value_scoring:
+                scaling_factors = scaling_factors[:, : v.size(2), :]
+                scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
 
-            v_scaled = v * scaling_factors
+                v_scaled = v * scaling_factors
 
-            # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-            v_rep = v_scaled.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                v_rep = v_scaled.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=1
+                )
 
-            attn_output, attn = scaled_dot_product_attention(
-                q,
-                k_rep,
-                v_rep,
-                attn_mask=kv_mask if mask is None else mask,
-                dropout_p=0.0,
-                attn_top_k=attn_top_k,
-                return_attn=self.kv_cache.return_attn(),
-            )
+            if self.use_gate:
+                attn_output, attn = scaled_dot_product_attention(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    return_attn=self.kv_cache.return_attn(),
+                )
 
-            # Combine attention output and bypass
-            gate = 0.1  # fixed value, maybe train correct gate value
-            y_combined = attn_output + gate * v_rep  # both [B, heads, seq, dim]
-            y = (
-                y
-                * attn_output.norm(dim=-1, keepdim=True)
-                / y_combined.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            )
+                # Combine attention output and bypass
+                gate = 0.1  # fixed value, maybe train correct gate value
+                y_combined = attn_output + gate * v_rep  # both [B, heads, seq, dim]
+                y = (
+                    y
+                    * attn_output.norm(dim=-1, keepdim=True)
+                    / y_combined.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                )
+            if self.use_attention_bias:
+                S = k.size(-2)
+                importance_scores = (
+                    scaling_factors[:, :S, :]  # truncate to actual sequence length
+                    .squeeze(-1)  # [n_local_heads, S]
+                    .repeat_interleave(
+                        self.n_head // self.n_local_heads, dim=0
+                    )  # [n_heads, S]
+                    .unsqueeze(0)  # [1, n_heads, S]
+                    .unsqueeze(2)  # [1, n_heads, 1, S] -> ready to add to attn_weight
+                )
+                y, attn = scaled_dot_product_attention_biased(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    return_attn=self.kv_cache.return_attn(),
+                    importance_scores=importance_scores,
+                )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
