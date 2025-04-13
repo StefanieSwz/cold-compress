@@ -420,7 +420,7 @@ class Attention(nn.Module):
         self.use_softmax = True
         self.use_gate = False
         self.use_value_scoring = True
-        self.use_key_scoring = True
+        self.use_key_scoring = False
         self.use_attention_bias = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -634,7 +634,7 @@ class Attention(nn.Module):
                     dropout_p=0.0,
                     attn_top_k=attn_top_k,
                     return_attn=self.kv_cache.return_attn(),
-                    importance_scores=importance_scores,
+                    importance_scores=S / 10,
                 )
             else:
                 y, attn = scaled_dot_product_attention(
