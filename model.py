@@ -590,7 +590,6 @@ class Attention(nn.Module):
                 )
 
             if self.use_gate:
-                pdb.set_trace()
                 attn_output, attn = scaled_dot_product_attention(
                     q,
                     k_rep,
