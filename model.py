@@ -418,8 +418,9 @@ class Attention(nn.Module):
         self.train_mode = False
         self.normalization = False
         self.use_softmax = True
-        self.use_gate = True
+        self.use_gate = False
         self.use_value_scoring = True
+        self.use_key_scoring = True
         self.use_attention_bias = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -588,6 +589,13 @@ class Attention(nn.Module):
                 v_rep = v_scaled.repeat_interleave(
                     self.n_head // self.n_local_heads, dim=1
                 )
+            if self.use_key_scoring:
+                k_scaled = k * scaling_factors
+
+                # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+                k_rep = k_scaled.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=1
+                )
 
             if self.use_gate:
                 attn_output, attn = scaled_dot_product_attention(
@@ -617,7 +625,7 @@ class Attention(nn.Module):
                     * attn_output.norm(dim=-1, keepdim=True)
                     / y_combined.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 )
-            if self.use_attention_bias:
+            elif self.use_attention_bias:
                 y, attn = scaled_dot_product_attention_biased(
                     q,
                     k_rep,
@@ -627,6 +635,16 @@ class Attention(nn.Module):
                     attn_top_k=attn_top_k,
                     return_attn=self.kv_cache.return_attn(),
                     importance_scores=importance_scores,
+                )
+            else:
+                y, attn = scaled_dot_product_attention(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    return_attn=self.kv_cache.return_attn(),
                 )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
