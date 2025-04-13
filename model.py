@@ -418,9 +418,9 @@ class Attention(nn.Module):
         self.train_mode = False
         self.normalization = False
         self.use_softmax = True
-        self.use_gate = False
+        self.use_gate = True
         self.use_value_scoring = True
-        self.use_attention_bias = True
+        self.use_attention_bias = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -590,6 +590,7 @@ class Attention(nn.Module):
                 )
 
             if self.use_gate:
+                pdb.set_trace()
                 attn_output, attn = scaled_dot_product_attention(
                     q,
                     k_rep,
@@ -599,10 +600,19 @@ class Attention(nn.Module):
                     attn_top_k=attn_top_k,
                     return_attn=self.kv_cache.return_attn(),
                 )
+                # Contextual bypass: [n_local_heads, S, 1] × [B, n_local_heads, S, D] → [B, n_local_heads, D]
+                contextual_bypass = torch.einsum("hsz,bhsd->bhd", scores, v)
+
+                # Expand to match attn_output shape: [B, n_heads, 1, D]
+                contextual_bypass = contextual_bypass.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=1
+                ).unsqueeze(2)
 
                 # Combine attention output and bypass
                 gate = 0.1  # fixed value, maybe train correct gate value
-                y_combined = attn_output + gate * v_rep  # both [B, heads, seq, dim]
+                y_combined = (
+                    attn_output + gate * contextual_bypass
+                )  # v_rep  # both [B, heads, seq, dim]
                 y = (
                     y
                     * attn_output.norm(dim=-1, keepdim=True)
