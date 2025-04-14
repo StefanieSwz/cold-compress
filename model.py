@@ -422,6 +422,7 @@ class Attention(nn.Module):
         self.use_value_scoring = True
         self.use_key_scoring = False
         self.use_attention_bias = False
+        self.use_output_scaling = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -532,6 +533,8 @@ class Attention(nn.Module):
             raw_scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos
             )  # try normalizing the scores
+            S = v.size(2)  # sequence length
+            raw_scores = raw_scores[:, :S]
             if self.normalization:
                 invalid_mask = torch.isinf(raw_scores)
                 # Compute per-head min and max ignoring -inf
@@ -556,10 +559,12 @@ class Attention(nn.Module):
 
             # TODO: Implement entropy control of factors
             if self.use_softmax:
+                budget = 0.3 * S
                 temperature = 1.2
-                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
+                scores = budget * F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
+                # Keep in mind: scores are almost uniformly distributed at beginning of training
                 # Scale keys and values using the scores
             else:
                 scores = torch.sigmoid(raw_scores).unsqueeze(
@@ -567,12 +572,9 @@ class Attention(nn.Module):
                 )  # Shape: [n_heads, seq_len, 1]
             # TODO: Try out different settings with key and / or value scaling
             # k = k * scaling_factors
-            # Truncate to valid sequence length
-            S = k.size(-2)
-            scores = scores[:, :S]  # truncate invalid tail positions
 
             # For value scaling — only needs to match [B, n_local_heads, S, 1]
-            scaling_factors = scores.unsqueeze(0)  # [1, n_local_heads, S, 1]
+            scaling_factors = scores.unsqueeze(0).expand_as(v[:, :, :, :1])
 
             # For attention bias — operates on query side → [1, n_heads, 1, S]
             importance_scores = (
@@ -646,6 +648,8 @@ class Attention(nn.Module):
                     attn_top_k=attn_top_k,
                     return_attn=self.kv_cache.return_attn(),
                 )
+            if self.use_output_scaling:
+                y = y * importance_scores.squeeze(2).unsqueeze(-1)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
