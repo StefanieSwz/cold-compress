@@ -559,7 +559,7 @@ class Attention(nn.Module):
 
             # TODO: Implement entropy control of factors
             if self.use_softmax:
-                budget = 0.3 * S
+                budget = 0.1 * S
                 temperature = 1.2
                 scores = budget * F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
                     -1
