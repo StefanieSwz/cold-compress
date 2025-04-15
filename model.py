@@ -420,9 +420,9 @@ class Attention(nn.Module):
         self.normalization = False
         self.use_softmax = True
         self.use_gate = False
-        self.use_value_scoring = True
+        self.use_value_scoring = False
         self.use_key_scoring = False
-        self.use_attention_bias = False
+        self.use_attention_bias = True
         self.use_output_scaling = False
         self._register_load_state_dict_pre_hook(self.load_hook)
 
@@ -560,11 +560,9 @@ class Attention(nn.Module):
 
             # TODO: Implement entropy control of factors
             if self.use_softmax:
-                budget = 0.1 * S
+                # budget = 0.1 * S
                 temperature = 0.7
-                scores = budget * F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
-                    -1
-                )
+                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(-1)
                 # scores = (
                 #     capped_rescale_projection(x=scores, z=budget)
                 #     .to(v.dtype)
@@ -580,13 +578,21 @@ class Attention(nn.Module):
             # For value scaling — only needs to match [B, n_local_heads, S, 1]
             scaling_factors = scores.unsqueeze(0).expand_as(v[:, :, :, :1])
 
-            # For attention bias — operates on query side → [1, n_heads, 1, S]
-            importance_scores = (
-                scores.repeat_interleave(self.n_head // self.n_local_heads, dim=0)
-                .unsqueeze(0)
-                .unsqueeze(2)
-                .squeeze(-1)
-            )
+            if self.use_attention_bias:
+                # For attention bias — repeat scores per row and then repeat for query head
+                # scores: [n_local_heads, seq_len, 1]
+                scores = scores.squeeze(-1)
+                importance_scores = torch.tril(
+                    scores.unsqueeze(1).repeat(1, scores.size(1), 1)
+                )  # [n_local_heads, seq_len, seq_len]
+                importance_scores = importance_scores / (
+                    importance_scores.sum(dim=2, keepdim=True) + 1e-8
+                )
+                importance_scores = importance_scores.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=0
+                ).unsqueeze(
+                    0
+                )  # [1, n_heads, seq_len, seq_len]
 
             if self.use_value_scoring:
                 v_scaled = v * torch.where(
@@ -644,7 +650,7 @@ class Attention(nn.Module):
                     dropout_p=0.0,
                     attn_top_k=attn_top_k,
                     return_attn=self.kv_cache.return_attn(),
-                    importance_scores=S / 10,
+                    importance_scores=importance_scores,
                 )
             else:
                 y, attn = scaled_dot_product_attention(

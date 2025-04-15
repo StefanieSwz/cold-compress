@@ -105,7 +105,7 @@ def scaled_dot_product_attention_biased(
 
     # 🔥 Add importance score bias
     if importance_scores is not None:
-        attn_weight += importance_scores / S
+        attn_weight += torch.log(importance_scores.clamp(min=1e-8))
 
     if attn_mask is not None:
         assert top_k == S, "Top-k attention not supported with masks."
@@ -121,7 +121,7 @@ def scaled_dot_product_attention_biased(
         attn_weight = attn_weight.gather(-1, top_k_idxs)
 
     attn_prob = torch.softmax(attn_weight, dim=-1)
-    attn_prob = torch.dropout(attn_prob, dropout_p, train=True)
+    # attn_prob = torch.dropout(attn_prob, dropout_p, train=True)
 
     return attn_prob @ value, attn_prob if return_attn else None
 
