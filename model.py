@@ -562,12 +562,14 @@ class Attention(nn.Module):
             if self.use_softmax:
                 budget = 0.1 * S
                 temperature = 0.7
-                scores = F.softmax(raw_scores / temperature, dim=-1)
-                scores = (
-                    capped_rescale_projection(x=scores, z=budget)
-                    .to(v.dtype)
-                    .unsqueeze(-1)
-                )  # Shape: [n_heads, seq_len, 1]
+                scores = budget * F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
+                    -1
+                )
+                # scores = (
+                #     capped_rescale_projection(x=scores, z=budget)
+                #     .to(v.dtype)
+                #     .unsqueeze(-1)
+                # )  # Shape: [n_heads, seq_len, 1]
                 # Keep in mind: scores are almost uniformly distributed at beginning of training
                 # Scale values using the scores
             else:
@@ -587,7 +589,11 @@ class Attention(nn.Module):
             )
 
             if self.use_value_scoring:
-                v_scaled = v * scaling_factors
+                v_scaled = v * torch.where(
+                    scaling_factors < 1.0,
+                    scaling_factors,
+                    torch.ones_like(scaling_factors),
+                )
 
                 # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
                 v_rep = v_scaled.repeat_interleave(
