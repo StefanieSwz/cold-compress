@@ -142,3 +142,33 @@ def project_to_capped_simplex(x, z=1.0):
     theta = cssv.gather(-1, rho.long()) / (rho + 1).float()
     w = torch.clamp(x - theta, min=0.0, max=1.0)
     return w
+
+
+def capped_rescale_projection(x, z):
+    """
+    Project x ∈ [0,1]^n with sum(x) <= z onto:
+        { w ∈ [0,1]^n | sum(w) = z }
+    while preserving proportions as much as possible.
+    """
+    x = x.clone()
+    support = torch.ones_like(x, dtype=torch.bool)
+    remaining_budget = z
+
+    for _ in range(10):  # usually converges very fast
+        x_support = x[support]
+        if x_support.sum() == 0:
+            break
+        scale = remaining_budget / x_support.sum()
+        scaled = x_support * scale
+        overflow = scaled > 1
+        x[support] = torch.where(overflow, torch.ones_like(scaled), scaled)
+
+        # SAFELY update support
+        new_support = support.clone()
+        new_support[support] = ~overflow
+        support = new_support
+
+        remaining_budget = z - x[~support].sum()
+        if not overflow.any():
+            break
+    return x

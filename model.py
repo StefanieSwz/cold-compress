@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from attention_utils import (
     scaled_dot_product_attention,
     scaled_dot_product_attention_biased,
-    project_to_capped_simplex,
+    capped_rescale_projection,
 )
 from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
@@ -560,14 +560,14 @@ class Attention(nn.Module):
 
             # TODO: Implement entropy control of factors
             if self.use_softmax:
-                # budget = 0.1 * S
+                budget = 0.1 * S
                 temperature = 0.7
-                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(-1)
-                # scores = (
-                #     project_to_capped_simplex(x=scores, z=budget)
-                #     .to(v.dtype)
-
-                # )  # Shape: [n_heads, seq_len, 1]
+                scores = F.softmax(raw_scores / temperature, dim=-1)
+                scores = (
+                    capped_rescale_projection(x=scores, z=budget)
+                    .to(v.dtype)
+                    .unsqueeze(-1)
+                )  # Shape: [n_heads, seq_len, 1]
                 # Keep in mind: scores are almost uniformly distributed at beginning of training
                 # Scale values using the scores
             else:
