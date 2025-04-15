@@ -124,3 +124,21 @@ def scaled_dot_product_attention_biased(
     attn_prob = torch.dropout(attn_prob, dropout_p, train=True)
 
     return attn_prob @ value, attn_prob if return_attn else None
+
+
+def project_to_capped_simplex(x, z=1.0):
+    """
+    Project x ∈ ℝ^n onto the capped simplex:
+        S = { x ∈ ℝ^n | 0 ≤ x_i ≤ 1, ∑ x_i = z }
+
+    Reference: Duchi et al. 2008
+    """
+    n = x.size(-1)
+    sorted_x, _ = torch.sort(x, descending=True, dim=-1)
+    cssv = torch.cumsum(sorted_x, dim=-1) - z
+    ind = torch.arange(n, device=x.device).float() + 1
+    cond = sorted_x - cssv / ind > 0
+    rho = cond.sum(dim=-1, keepdim=True) - 1
+    theta = cssv.gather(-1, rho.long()) / (rho + 1).float()
+    w = torch.clamp(x - theta, min=0.0, max=1.0)
+    return w

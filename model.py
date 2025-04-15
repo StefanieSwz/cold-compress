@@ -18,6 +18,7 @@ from torch.nn import functional as F
 from attention_utils import (
     scaled_dot_product_attention,
     scaled_dot_product_attention_biased,
+    project_to_capped_simplex,
 )
 from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
@@ -561,17 +562,16 @@ class Attention(nn.Module):
             if self.use_softmax:
                 budget = 0.1 * S
                 temperature = 0.7
-                scores = budget * F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
+                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
+                scores = project_to_capped_simplex(x=scores, z=budget).to(v.dtype)
                 # Keep in mind: scores are almost uniformly distributed at beginning of training
-                # Scale keys and values using the scores
+                # Scale values using the scores
             else:
                 scores = torch.sigmoid(raw_scores).unsqueeze(
                     -1
                 )  # Shape: [n_heads, seq_len, 1]
-            # TODO: Try out different settings with key and / or value scaling
-            # k = k * scaling_factors
 
             # For value scaling — only needs to match [B, n_local_heads, S, 1]
             scaling_factors = scores.unsqueeze(0).expand_as(v[:, :, :, :1])
