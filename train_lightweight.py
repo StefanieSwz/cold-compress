@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import torch._dynamo.config
 import torch._inductor.config
@@ -310,8 +311,15 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-5,  # 1e-3 -- e-6 --> see which gives best convergence
+        default=5e-3,  # 1e-3 -- e-6 --> see which gives best convergence
         help="Learning rate for training.",
+    )
+
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,  # 1e-3 -- e-6 --> see which gives best convergence
+        help="Weight decay for training.",
     )
 
     parser.add_argument(
@@ -520,7 +528,19 @@ def main(args: argparse.Namespace) -> None:
     print(f"Total number of trainable parameters: {num_trainable_params:.2f}")
 
     # Optimizer
-    optimizer = AdamW(model.get_lightweight_params(), lr=args.learning_rate)
+    optimizer = AdamW(
+        model.get_lightweight_params(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",  # we want to minimize validation loss
+        factor=0.5,  # reduce LR by half
+        patience=1,  # wait 1 epochs before reducing LR
+        verbose=True,  # log when LR is reduced
+        min_lr=1e-6,  # prevent LR from getting too small
+    )
     loss = nn.CrossEntropyLoss(
         ignore_index=args.ignore_index, reduction="mean"
     )  # reduction is set to 'mean', thus the loss is automatically normalized by the number of tokens that are not ignored.
@@ -641,6 +661,7 @@ def main(args: argparse.Namespace) -> None:
                 reset_caches(model)
 
         avg_val_loss = total_val_loss / len(val_loader)
+        scheduler.step(avg_val_loss)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss})
 
