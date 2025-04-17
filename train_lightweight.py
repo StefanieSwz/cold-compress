@@ -361,6 +361,20 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         help="If set to true, the evaluation script is called and result artifacts are saved in the same wandb run.",
     )
 
+    parser.add_argument(
+        "--score_method",
+        default='probabilistic',
+        choices=['probabilistic', 'explicit'],
+        help='The scoring method for removing k/v pairs'
+    )
+
+    parser.add_argument(
+        "--max_temperature",
+        default=1.0,
+        type=float,
+        help="Maximum temperature for relaxd Bernoulli."
+    )
+
 
 def prepare_dataset(
     tokenizer: nn.Module, args: argparse.Namespace
@@ -485,6 +499,7 @@ def main(args: argparse.Namespace) -> None:
         "vector_convolution": args.vector_convolution,
         "convolution_features": args.convolution_features,
         "feature_selection": args.feature_selection,
+        "score_method": args.score_method
     }
     wandb.config.update(cache_kwargs)
 
@@ -523,6 +538,9 @@ def main(args: argparse.Namespace) -> None:
 
     accumulated_loss = 0
 
+    # linear schedule for the auxiliary loss
+    temperature_sched = lambda t: np.interp([t], [0, args.epochs], [args.max_temperature, 0])[0]
+
     for epoch in range(args.epochs):
         total_loss = 0
         optimizer.zero_grad()
@@ -552,7 +570,11 @@ def main(args: argparse.Namespace) -> None:
 
             # Forward pass
             # torch.autograd.set_detect_anomaly(True)
-            logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
+            if args.score_method == 'probabilistic':
+                temperature = temperature_sched(epoch + (i + 1) / len(train_loader))
+                logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True, temperature=temperature)
+            else:
+                logits = model(input_ids, input_pos, mask=causal_mask, is_prefill=True)
 
             # Reshape logits and labels for loss computation
             logits = logits[:, :-1].reshape(-1, logits.size(-1))
@@ -704,7 +726,7 @@ def main(args: argparse.Namespace) -> None:
             "--trained_weights",
             "none",
             "--lightweight_model_version",
-            str(artifact_ref.version),
+            # str(artifact_ref.version),
         ]
         print(f"Executing evaluation script with arguments: {eval_command}")
         subprocess.run(eval_command)

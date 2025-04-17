@@ -9,3 +9,4 @@ convolution_features: ["embedding", "key", "value", "query"] # TODO: use differe
 feature_selection: ["attn_score", "vector_norm", "vector_cv", "vector_z_score", "token_profiling", "convolution", "normalized_pos"]
 trained_weights: "none" # "./lightweight_weights/Qwen2-0.5B-Instruct/20250124_105117_linear.pth"
 # max_cache_length: [1024]
+score_method: "probablisitic"

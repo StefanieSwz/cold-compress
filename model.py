@@ -339,6 +339,7 @@ class Transformer(nn.Module):
         is_prefill: Tensor,
         mask: Optional[Tensor] = None,
         attn_top_k: Optional[float] = 1.0,
+        temperature: Optional[float] = 0.999
     ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         freqs_cis = self.freqs_cis[input_pos]
@@ -354,6 +355,7 @@ class Transformer(nn.Module):
                 freqs_cis,
                 mask,
                 attn_top_k=attn_top_k,
+                temperature=temperature
             )
         x = self.norm(x)
         logits = self.output(x)
@@ -381,6 +383,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         attn_top_k: Optional[float] = 1.0,
+        temperature: Optional[float] = 0.999
     ) -> Tensor:
         h = x + self.attention(
             self.attention_norm(x),
@@ -390,6 +393,7 @@ class TransformerBlock(nn.Module):
             is_prefill,
             input_pos,
             attn_top_k=attn_top_k,
+            temperature=temperature
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -438,7 +442,9 @@ class Attention(nn.Module):
         is_prefill: bool,
         input_pos: Optional[Tensor] = None,
         attn_top_k: Optional[float] = 1.0,
+        temperature: Optional[float] = 0.999
     ) -> Tensor:
+        assert temperature <= 1.0 and temperature >= 0.0
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -502,6 +508,7 @@ class Attention(nn.Module):
                     cache_kwargs["convolution_features"] = (
                         self.kv_cache.convolution_features
                     )
+                    cache_kwargs["score_method"] = self.kv_cache.score_method
             input_pos, k, v, attn = self.compress_prompt(
                 input_pos, k, v, attn, **cache_kwargs
             )
@@ -518,18 +525,27 @@ class Attention(nn.Module):
             and is_prefill
             and isinstance(self.kv_cache, KVCacheLightweight)
         ):
-            # Compute scores using KVCacheLightweight
-            scores = self.kv_cache._token_importances(  # pylint: disable=W0212
-                input_pos
-            )  # try normalizing the scores
-            # Scale keys and values using the scores
-            scaling_factors = torch.sigmoid(scores).unsqueeze(
-                -1
-            )  # Shape: [n_heads, seq_len, 1]
-            # TODO: Try out different settings with key and / or value scaling
-            # k = k * scaling_factors
-            scaling_factors = scaling_factors[:, : v.size(2), :]
-            scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+            if cache_kwargs["score_method"] == 'explicit':
+                # Compute scores using KVCacheLightweight
+                scores = self.kv_cache._token_importances(  # pylint: disable=W0212
+                    input_pos
+                )  # try normalizing the scores
+                # Scale keys and values using the scores
+                scaling_factors = torch.sigmoid(scores).unsqueeze(
+                    -1
+                )  # Shape: [n_heads, seq_len, 1]
+                # TODO: Try out different settings with key and / or value scaling
+                # k = k * scaling_factors
+                scaling_factors = scaling_factors[:, : v.size(2), :]
+                scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
+            elif cache_kwargs["score_method"] == 'probabilistic':
+                scaling_factors = self.kv_cache._probabilistic_masking(
+                    input_pos, 
+                    temperature=temperature
+                )
+                scaling_factors = scaling_factors.unsqueeze(-1)
+                scaling_factors = scaling_factors[:, : v.size(2), :]
+                scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
 
             v_scaled = v * scaling_factors
 

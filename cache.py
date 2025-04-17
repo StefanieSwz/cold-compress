@@ -164,6 +164,12 @@ def add_cache_arguments(parser: argparse.ArgumentParser):
         help="Mininum fraction of recovered attentions (|compressed_attn - uncompressed_attn| < epsilon). The lower the value, the higher the compression.",
     )
 
+    parser.add_argument(
+        "--score_method",
+        default='probabilistic',
+        choices=['probabilistic', 'explicit'],
+        help='The scoring method for removing k/v pairs'
+    )
 
 def cache_compatibility(args):
     for length, cache_strat, prompt_strat in zip(
@@ -696,6 +702,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         "convolution_features",
         "token_ids",
         "trained_weights",
+        "score_method"
     ]
 
     def __init__(
@@ -881,6 +888,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                     conv_block.apply(init_weights)
             for model in self.models:
                 model.apply(init_weights)
+        self.score_method = kwargs["score_method"]
 
     def reset(self) -> None:
         """
@@ -1422,7 +1430,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         # Evict least important token
         return torch.argmin(scores, dim=-1)
 
-    def _token_importances(self, input_pos: torch.Tensor) -> torch.Tensor:
+    def _token_importances(self, input_pos: torch.Tensor, return_raw_scores=False) -> torch.Tensor:
         """
         Compute token importance scores using lightweight models.
 
@@ -1496,6 +1504,8 @@ class KVCacheLightweight(KVCacheHeadSpecific):
             device=features.device,
         )
 
+        raw_scores = scores
+
         # Compute scores for the current valid positions using the lightweight models
         for head_idx, model in enumerate(self.models):
             valid = self.pos[:, head_idx, :] != -1  # Boolean mask of valid positions
@@ -1508,9 +1518,27 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         # Remove batch dimension if batch_size == 1, as the method is not batch-compatible yet
         if scores.shape[0] == 1:
             scores = scores.squeeze(0)  # Resulting shape: [n_heads, max_cache_length]
+        if return_raw_scores is True:
+            return scores, raw_scores
+        else:
+            return scores
+    
+    def _probabilistic_masking(self, input_pos, temperature):
+        # Probabilisitic masking of tokens
+        scores, raw_scores = self._token_importances(input_pos, return_raw_scores=True)
+        if scores.ndim == 1:
+            scores = scores.unsqueeze(0)
+        
+        # Continuous Bernoulli distribution to sample masks
+        dist = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(logits=scores, temperature=temperature)
 
-        return scores
+        # Sampling based on Bernoulli distribution
+        # Differentiable using reparameterization trick
+        mask = dist.rsample()
 
+        # Return mask and the score magnitude
+        # Minimize score magnitude == (mask_prob = 0.5)
+        return mask
 
 class KVCacheHeavyHitter(KVCacheHeadSpecific):
     # This class mostly follows the logic in ScissorHands (https://arxiv.org/abs/2305.17118)
