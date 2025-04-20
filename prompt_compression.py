@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
+import pdb
 
 from cache_utils import get_convolution_params
 
@@ -316,8 +317,10 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
 
         if "attn_score" in kwargs["feature_selection"]:
             attn = kwargs["attn"]
-            attn_score = attn.mean(dim=2)
-            features_to_cat.append(attn_score.unsqueeze(-1))
+            T = attn.shape[-1]
+            denom = torch.arange(T, 0, -1, device=attn.device)
+            attn_score = attn.sum(dim=2) / denom
+            features_to_cat.append(attn_score.unsqueeze(-1))  # shape: [B, H, T, 1]
         if "vector_norm" in kwargs["feature_selection"]:
             key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
             value_norm = torch.linalg.vector_norm(v_val, ord=2, dim=-1)
