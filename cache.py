@@ -6,6 +6,7 @@ from collections import Counter
 import regex as re
 import torch
 import torch.nn as nn
+import pdb
 
 from prompt_compression import get_prompt_compressor_constructor
 from cache_utils import get_convolution_params
@@ -1196,8 +1197,13 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                         self.embedding_z = embedding_z.detach()
                 if "attn_score" in self.feature_selection:
                     if attn.ndim == 4:
-                        seq_len_actual = attn.shape[-1]
-                        attn = attn.squeeze(0).sum(dim=1) / (seq_len_actual - input_pos)
+                        # For training or no prompt compressor for attn output
+                        T = attn.shape[-1]
+                        row_counts = torch.arange(1, T + 1, device=attn.device)  # [T]
+                        row_counts = row_counts.view(1, 1, T, 1)  # [1,H,T,1]
+                        attn_scaled = attn * row_counts
+                        denom = torch.arange(T, 0, -1, device=attn.device)
+                        attn = attn_scaled.sum(dim=2) / denom
                     attn = attn.view(
                         1, self.n_heads, -1
                     )  # [batch_size, n_heads, prompt_len]
@@ -1359,9 +1365,9 @@ class KVCacheLightweight(KVCacheHeadSpecific):
                 # Update running average attention score
                 attn_full[valid_mask] = (
                     self.attn_score[valid_mask]
-                    * (n_updates[valid_mask] - 1).to(self.attn_score.dtype)
-                    + attn[valid_mask]
-                ) / n_updates[valid_mask].to(self.attn_score.dtype)
+                    * (n_updates[valid_mask]).to(self.attn_score.dtype)
+                    + attn[valid_mask] * (input_pos + 1)
+                ) / (n_updates[valid_mask].to(self.attn_score.dtype) + 1)
 
                 self.attn_score[...] = attn_full.detach()
             if "token_profiling" in self.feature_selection:

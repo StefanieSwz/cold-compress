@@ -318,8 +318,11 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
         if "attn_score" in kwargs["feature_selection"]:
             attn = kwargs["attn"]
             T = attn.shape[-1]
+            row_counts = torch.arange(1, T + 1, device=attn.device)  # [T]
+            row_counts = row_counts.view(1, 1, T, 1)  # [1,H,T,1]
+            attn_scaled = attn * row_counts
             denom = torch.arange(T, 0, -1, device=attn.device)
-            attn_score = attn.sum(dim=2) / denom
+            attn_score = attn_scaled.sum(dim=2) / denom
             features_to_cat.append(attn_score.unsqueeze(-1))  # shape: [B, H, T, 1]
         if "vector_norm" in kwargs["feature_selection"]:
             key_norm = torch.linalg.vector_norm(k_val, ord=2, dim=-1)
@@ -462,10 +465,17 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
 
     def _update_state(self, keep_idxs, input_pos, **kwargs):
         # only update attention, rest is done in kv_cache.update_state()
-        seq_len = input_pos.shape[-1]
+        # T = input_pos.shape[-1]
         # Return average attention across prompt to insert into KV Cache's attention history tracker
-        cum_attn = kwargs["attn"].sum(dim=2) / (seq_len - input_pos)
-        cum_attn = cum_attn.gather(2, keep_idxs.view(1, -1, self.max_cache_length))
+        attn = kwargs["attn"]
+        T = attn.shape[-1]
+        row_counts = torch.arange(1, T + 1, device=attn.device)  # [T]
+        row_counts = row_counts.view(1, 1, T, 1)  # [1,H,T,1]
+        attn_scaled = attn * row_counts
+        denom = torch.arange(T, 0, -1, device=attn.device)
+        attn_score = attn_scaled.sum(dim=2) / denom
+        # cum_attn = kwargs["attn"].sum(dim=2) / (seq_len - input_pos)
+        cum_attn = attn_score.gather(2, keep_idxs.view(1, -1, self.max_cache_length))
         return cum_attn
 
 

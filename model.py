@@ -516,7 +516,7 @@ class Attention(nn.Module):
                     )
             input_pos, k, v, attn = self.compress_prompt(
                 input_pos, k, v, attn, **cache_kwargs
-            )
+            )  # attn already transformed for scoring
             with torch.no_grad():
                 self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
 
