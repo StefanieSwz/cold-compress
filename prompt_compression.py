@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
 import pdb
+import wandb
 
 from cache_utils import get_convolution_params
 
@@ -168,6 +169,7 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
         nn.Module.__init__(self)
 
         self.feature_space_dim = 0  # Number of final features
+        self.logged_scores = []  # For logging purposes
 
         # Get feature size
         if "attn_score" in kwargs["feature_selection"]:
@@ -460,6 +462,22 @@ class PromptCompressorLightweight(PromptCompressorHeadSpecific, nn.Module):
         # Give high score to global and recent tokens
         save_mask = self._recent_global_mask(input_pos).view(1, 1, -1)
         priority = priority.masked_fill(save_mask, float("inf"))
+
+        if wandb.run is not None:
+            batch_size, n_heads, n_tokens = priority.shape
+
+            for head_idx in range(n_heads):
+                for token_idx in range(n_tokens):
+                    score = priority[0, head_idx, token_idx].item()
+
+                    self.logged_scores.append(
+                        {
+                            "head": head_idx,
+                            "token_pos": token_idx,  # token_idx directly corresponds to input_pos
+                            "importance_score": score,
+                            "input_pos": n_tokens,
+                        }
+                    )
 
         return priority
 

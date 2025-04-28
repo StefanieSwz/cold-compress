@@ -7,6 +7,7 @@ import regex as re
 import torch
 import torch.nn as nn
 import pdb
+import wandb
 
 from prompt_compression import get_prompt_compressor_constructor
 from cache_utils import get_convolution_params
@@ -723,6 +724,7 @@ class KVCacheLightweight(KVCacheHeadSpecific):
             max_batch_size, n_heads, head_dim, dtype, variable_length, **kwargs
         )
         self.feature_space_dim = 0  # Number of final features
+        self.logged_scores = []
 
         # Initialize buffers for features.
         # norm is l2 norm, cv is coefficient of variation (sd/mean), z is z-score (x_max - mean / sd)
@@ -1429,6 +1431,27 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         scores.masked_fill_(
             self.pos.squeeze(0) >= input_pos - self.recent_window, float("inf")
         )
+
+        if wandb.run is not None:
+            n_heads, n_tokens = scores.shape
+            for head_idx in range(n_heads):
+                for token_idx in range(n_tokens):
+                    score = scores[head_idx, token_idx].item()
+                    token_pos = self.pos.view(scores.shape)[head_idx, token_idx].item()
+
+                    if token_pos != -1:
+                        self.logged_scores.append(
+                            {
+                                "head": head_idx,
+                                "token_pos": token_pos,
+                                "importance_score": score,
+                                "input_pos": (
+                                    input_pos.item()
+                                    if isinstance(input_pos, torch.Tensor)
+                                    else input_pos
+                                ),
+                            }
+                        )
 
         # Evict least important token
         return torch.argmin(scores, dim=-1)
