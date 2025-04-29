@@ -1431,8 +1431,8 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         scores.masked_fill_(
             self.pos.squeeze(0) >= input_pos - self.recent_window, float("inf")
         )
-        if (isinstance(input_pos, torch.Tensor) and input_pos.item() % 2 == 1) or (
-            isinstance(input_pos, int) and input_pos % 2 == 1
+        if (isinstance(input_pos, torch.Tensor) and input_pos.item() % 5 == 1) or (
+            isinstance(input_pos, int) and input_pos % 5 == 1
         ):
             if wandb.run is not None:
                 n_heads, n_tokens = scores.shape
