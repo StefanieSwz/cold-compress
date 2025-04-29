@@ -1431,27 +1431,31 @@ class KVCacheLightweight(KVCacheHeadSpecific):
         scores.masked_fill_(
             self.pos.squeeze(0) >= input_pos - self.recent_window, float("inf")
         )
+        if (isinstance(input_pos, torch.Tensor) and input_pos.item() % 2 == 1) or (
+            isinstance(input_pos, int) and input_pos % 2 == 1
+        ):
+            if wandb.run is not None:
+                n_heads, n_tokens = scores.shape
+                for head_idx in range(n_heads):
+                    for token_idx in range(n_tokens):
+                        score = scores[head_idx, token_idx].item()
+                        token_pos = self.pos.view(scores.shape)[
+                            head_idx, token_idx
+                        ].item()
 
-        if wandb.run is not None:
-            n_heads, n_tokens = scores.shape
-            for head_idx in range(n_heads):
-                for token_idx in range(n_tokens):
-                    score = scores[head_idx, token_idx].item()
-                    token_pos = self.pos.view(scores.shape)[head_idx, token_idx].item()
-
-                    if token_pos != -1:
-                        self.logged_scores.append(
-                            {
-                                "head": head_idx,
-                                "token_pos": token_pos,
-                                "importance_score": score,
-                                "input_pos": (
-                                    input_pos.item()
-                                    if isinstance(input_pos, torch.Tensor)
-                                    else input_pos
-                                ),
-                            }
-                        )
+                        if token_pos != -1:
+                            self.logged_scores.append(
+                                {
+                                    "head": head_idx,
+                                    "token_pos": token_pos,
+                                    "importance_score": score,
+                                    "input_pos": (
+                                        input_pos.item()
+                                        if isinstance(input_pos, torch.Tensor)
+                                        else input_pos
+                                    ),
+                                }
+                            )
 
         # Evict least important token
         return torch.argmin(scores, dim=-1)
