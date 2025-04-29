@@ -844,7 +844,7 @@ class UltraChat(EvaluationTask):
         if split == "val_gen":
             split_name = "train_gen"
         if not self.is_ready[split_name]:
-            split_data = self.dataset[split_name]
+            split_data = self.dataset[split_name][1]
             # if split == "test_gen":
             #     split_data = split_data.select(
             #         range(min(len(split_data), EVAL_LENGTH))
