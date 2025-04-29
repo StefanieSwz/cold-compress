@@ -516,7 +516,7 @@ def generate(
 
     # After prefilling
     if wandb.run is not None:
-        relevant_layers = {0, 1, 12, 13, 14, 26, 27}
+        relevant_layers = {0, 1, 12, 14, 26, 27}
         for layer_idx, layer in enumerate(model.layers):
             if layer_idx in relevant_layers:
                 if hasattr(layer.attention.prompt_compressor, "logged_scores"):
@@ -556,7 +556,7 @@ def generate(
 
     # After decoding
     if wandb.run is not None:
-        relevant_layers = {0, 1, 12, 13, 14, 26, 27}
+        relevant_layers = {0, 1, 12, 14, 26, 27}
         for layer_idx, layer in enumerate(model.layers):
             if layer_idx in relevant_layers:
                 if hasattr(layer.attention.kv_cache, "logged_scores"):
