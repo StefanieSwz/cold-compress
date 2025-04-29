@@ -243,8 +243,7 @@ def run_task(
                 for token_id in token_ids_prompt
             ]
             token_texts_prompt = [
-                tokenizer.decode([token_id], skip_special_tokens=False)
-                for token_id in token_ids_prompt
+                tokenizer.decode([token_id]) for token_id in token_ids_prompt
             ]
         next_tokens = None if label_ids is None else label_ids[i].to(device)
         prompt_length = input.size(0)
@@ -287,8 +286,7 @@ def run_task(
                 for token_id in token_ids_decode
             ]
             token_texts_decode = [
-                tokenizer.decode([token_id], skip_special_tokens=False)
-                for token_id in token_ids_decode
+                tokenizer.decode([token_id]) for token_id in token_ids_decode
             ]
 
             table_prefill_tokens = wandb.Table(
