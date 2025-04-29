@@ -516,17 +516,19 @@ def generate(
 
     # After prefilling
     if wandb.run is not None:
+        relevant_layers = {0, 1, 12, 13, 14, 26, 27}
         for layer_idx, layer in enumerate(model.layers):
-            if hasattr(layer.attention.prompt_compressor, "logged_scores"):
-                for entry in layer.attention.prompt_compressor.logged_scores:
-                    table_prefill.add_data(
-                        True,
-                        entry["token_pos"],
-                        layer_idx,
-                        entry["head"],
-                        entry["input_pos"],
-                        entry["importance_score"],
-                    )
+            if layer_idx in relevant_layers:
+                if hasattr(layer.attention.prompt_compressor, "logged_scores"):
+                    for entry in layer.attention.prompt_compressor.logged_scores:
+                        table_prefill.add_data(
+                            True,
+                            entry["token_pos"],
+                            layer_idx,
+                            entry["head"],
+                            entry["input_pos"],
+                            entry["importance_score"],
+                        )
 
     prefill_seconds = t1 - t0
 
