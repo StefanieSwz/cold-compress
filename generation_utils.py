@@ -3,6 +3,7 @@ import time
 from typing import Optional, Tuple
 from pathlib import Path
 import argparse
+import wandb
 
 import torch
 import torch._dynamo.config
@@ -479,32 +480,27 @@ def generate(
     seq[:prompt_length] = prompt
     input_pos = torch.arange(0, prompt_length, device=device)
 
-    import wandb
-
-    table_prefill = wandb.Table(
-        columns=[
-            "prefill",
-            "token_idx",
-            "token_id",
-            "token_text",
-            "layer",
-            "head",
-            "input_pos",
-            "importance_score",
-        ]
-    )
-    table_decode = wandb.Table(
-        columns=[
-            "prefill",
-            "token_idx",
-            "token_id",
-            "token_text",
-            "layer",
-            "head",
-            "input_pos",
-            "importance_score",
-        ]
-    )
+    if wandb.run is not None:
+        table_prefill = wandb.Table(
+            columns=[
+                "prefill",
+                "token_idx",
+                "layer",
+                "head",
+                "input_pos",
+                "importance_score",
+            ]
+        )
+        table_decode = wandb.Table(
+            columns=[
+                "prefill",
+                "token_idx",
+                "layer",
+                "head",
+                "input_pos",
+                "importance_score",
+            ]
+        )
 
     t0 = time.perf_counter()
 
@@ -519,19 +515,18 @@ def generate(
     t1 = time.perf_counter()
 
     # After prefilling
-    for layer_idx, layer in enumerate(model.layers):
-        if hasattr(layer.attention.prompt_compressor, "logged_scores"):
-            for entry in layer.attention.prompt_compressor.logged_scores:
-                table_prefill.add_data(
-                    True,
-                    entry["token_pos"],
-                    None,  # token_id
-                    None,  # token_text
-                    layer_idx,
-                    entry["head"],
-                    entry["input_pos"],
-                    entry["importance_score"],
-                )
+    if wandb.run is not None:
+        for layer_idx, layer in enumerate(model.layers):
+            if hasattr(layer.attention.prompt_compressor, "logged_scores"):
+                for entry in layer.attention.prompt_compressor.logged_scores:
+                    table_prefill.add_data(
+                        True,
+                        entry["token_pos"],
+                        layer_idx,
+                        entry["head"],
+                        entry["input_pos"],
+                        entry["importance_score"],
+                    )
 
     prefill_seconds = t1 - t0
 
@@ -558,26 +553,25 @@ def generate(
     total_seconds = t2 - t0
 
     # After decoding
-    for layer_idx, layer in enumerate(model.layers):
-        if hasattr(layer.attention.kv_cache, "logged_scores"):
-            for entry in layer.attention.kv_cache.logged_scores:
-                table_decode.add_data(
-                    False,
-                    entry["token_pos"],
-                    None,  # token_id
-                    None,  # token_text
-                    layer_idx,
-                    entry["head"],
-                    entry["input_pos"],
-                    entry["importance_score"],
-                )
+    if wandb.run is not None:
+        for layer_idx, layer in enumerate(model.layers):
+            if hasattr(layer.attention.kv_cache, "logged_scores"):
+                for entry in layer.attention.kv_cache.logged_scores:
+                    table_decode.add_data(
+                        False,
+                        entry["token_pos"],
+                        layer_idx,
+                        entry["head"],
+                        entry["input_pos"],
+                        entry["importance_score"],
+                    )
 
-    wandb.log(
-        {
-            "Importance Scores Prefill": table_prefill,
-            "Importance Scores Decode": table_decode,
-        }
-    )
+        wandb.log(
+            {
+                "Importance Scores Prefill": table_prefill,
+                "Importance Scores Decode": table_decode,
+            }
+        )
 
     prefill_tokens = prompt_length
     decode_tokens = (

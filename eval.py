@@ -227,6 +227,25 @@ def run_task(
 
     for i in tqdm(range(len(inputs))):
         input = inputs[i].to(device)
+
+        if wandb.run is not None:
+            token_ids_prompt = input.tolist()
+            token_id_types_prompt = [
+                (
+                    "special"
+                    if token_id in tokenizer.special_ids()
+                    else (
+                        "punctuation"
+                        if token_id in tokenizer.punctuation_ids()
+                        else "normal"
+                    )
+                )
+                for token_id in token_ids_prompt
+            ]
+            token_texts_prompt = [
+                tokenizer.decode([token_id], skip_special_tokens=False)
+                for token_id in token_ids_prompt
+            ]
         next_tokens = None if label_ids is None else label_ids[i].to(device)
         prompt_length = input.size(0)
         max_new_tokens = min(task.max_tokens, max_seq_length - prompt_length)
@@ -251,6 +270,49 @@ def run_task(
                 attn_top_k=args.attn_top_k,
                 feed_long_prompts=feed_long_prompts,
                 decode_first_token=decode_first_token,
+            )
+
+        if wandb.run is not None:
+            token_ids_decode = y.tolist()  # List of token ids
+            token_id_types_decode = [
+                (
+                    "special"
+                    if token_id in tokenizer.special_ids()
+                    else (
+                        "punctuation"
+                        if token_id in tokenizer.punctuation_ids()
+                        else "normal"
+                    )
+                )
+                for token_id in token_ids_decode
+            ]
+            token_texts_decode = [
+                tokenizer.decode([token_id], skip_special_tokens=False)
+                for token_id in token_ids_decode
+            ]
+
+            table_prefill_tokens = wandb.Table(
+                columns=["token_idx", "token_id", "token_id_types", "token_text"]
+            )
+            table_decode_tokens = wandb.Table(
+                columns=["token_idx", "token_id", "token_id_types", "token_text"]
+            )
+            for idx, (token_id, token_type, token_text) in enumerate(
+                zip(token_ids_prompt, token_id_types_prompt, token_texts_prompt)
+            ):
+                table_prefill_tokens.add_data(idx, token_id, token_type, token_text)
+
+            for idx, (token_id, token_type, token_text) in enumerate(
+                zip(token_ids_decode, token_id_types_decode, token_texts_decode)
+            ):
+                full_idx = prompt_length + idx
+                table_decode_tokens.add_data(full_idx, token_id, token_type, token_text)
+
+            wandb.log(
+                {
+                    "Tokens Prompt": table_prefill_tokens,
+                    "Tokens Decode": table_decode_tokens,
+                }
             )
 
         for k, v in perf_stats.items():
@@ -544,15 +606,16 @@ def main(
                     "cache_strategy": str(cache_strategy_list[0]),
                 }
                 if "model_artifact" in locals():
-                    metadata["features"] = model_artifact.metadata.get("feature_selection", None)
-            
+                    metadata["features"] = model_artifact.metadata.get(
+                        "feature_selection", None
+                    )
+
                 # Create artifact with the correct metadata
                 artifact = wandb.Artifact(
                     name="evaluation_results",
                     type="evaluation",
                     metadata=metadata,
                 )
-
 
                 # Add general result files
                 if args_fn.exists():
