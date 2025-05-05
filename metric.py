@@ -228,17 +228,34 @@ class LLMRouge(Metric):
         return {"llm_rouge": sum(scores) / len(scores)}
 
 
+# NOTE: Experimental feature, not yet fully functional
 class LLMRougeLlama(Metric):
+    """
+    LLM-based ROUGE evaluator using Meta's LLaMA 3.2 3B Instruct model.
+
+    This metric queries the LLM with a templated prompt comparing a prediction to
+    reference labels. The LLM returns a numeric ROUGE-like score, extracted from its output.
+    """
+
     def __init__(
         self,
         num_retries=5,
         **kwargs,
     ):
+        """
+        Initializes the metric.
+
+        Args:
+            num_retries (int): Maximum number of retry attempts if generation fails.
+            **kwargs: Additional arguments for the parent Metric class.
+        """
         super().__init__(**kwargs)
         self.num_retries = num_retries
 
     def _load_metric(self, **kwargs):
-        # Load model and tokenizer
+        """
+        Loads the LLaMA model and tokenizer.
+        """
         model_name = "meta-llama/Llama-3.2-3B-Instruct"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -247,9 +264,31 @@ class LLMRougeLlama(Metric):
         self.model.eval()
 
     def parse_int(self, text):
+        """
+        Extracts the first digit from the model output.
+
+        Args:
+            text (str): The LLM-generated output text.
+
+        Returns:
+            int: The first digit found in the text.
+
+        Raises:
+            ValueError: If no digit is found.
+        """
         return int(re.search(r"\d", text).group())
 
     def _generate_response(self, prompt, max_new_tokens=100):
+        """
+        Generates a response from the LLM given a prompt.
+
+        Args:
+            prompt (str): The prompt to feed into the LLM.
+            max_new_tokens (int): Maximum number of new tokens to generate.
+
+        Returns:
+            str: Decoded LLM output text (stripped).
+        """
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             outputs = self.model.generate(
@@ -269,6 +308,20 @@ class LLMRougeLlama(Metric):
         return decoded.strip()
 
     def compute(self, prompts, predictions, labels):
+        """
+        Computes average LLM-based ROUGE scores over all samples.
+
+        For each prediction-label pair, a reference prompt is constructed and scored by the LLM.
+        If generation fails, retries are attempted with exponential backoff.
+
+        Args:
+            prompts: Unused (for compatibility with base Metric).
+            predictions (List[str]): Model-generated outputs.
+            labels (List[str]): Reference outputs.
+
+        Returns:
+            Dict[str, float]: Dictionary with averaged LLM-based ROUGE score.
+        """
         scores = []
 
         for p, ls in zip(predictions, labels):
@@ -363,7 +416,22 @@ class LLMJudge(LLMRouge):
         return {k: np.mean([s[k] for s in scores]) for k in self.criteria}
 
 
+# NOTE: Experimental feature, not yet fully functional
 class LLMJudgeLlama(LLMRougeLlama):
+    """
+    LLM-based multi-criteria evaluator using Meta's LLaMA 3.2 3B Instruct model.
+
+    This metric prompts the LLM to score predictions across multiple evaluation
+    criteria (e.g., coherence, faithfulness, helpfulness) and parses the
+    generated scorecard into a dictionary of numeric scores.
+
+    Attributes:
+        criteria (List[str]): Sorted list of evaluation dimensions.
+        criteria_def (str): Prompt-formatted description of each criterion.
+        prefill (str): Scorecard header added to the prompt.
+        max_new_tokens (int): Max token budget for scorecard generation.
+    """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -375,6 +443,18 @@ class LLMJudgeLlama(LLMRougeLlama):
         )
 
     def parse_scorecard(self, scorecard):
+        """
+        Parses the LLM-generated scorecard into a dictionary of scores.
+
+        Args:
+            scorecard (str): Raw LLM output containing scores.
+
+        Returns:
+            Dict[str, int]: Dictionary mapping each criterion to its numeric score.
+
+        Raises:
+            Exception: If the scorecard cannot be parsed.
+        """
         try:
             scores = {}
             for crit in self.criteria:
@@ -390,6 +470,16 @@ class LLMJudgeLlama(LLMRougeLlama):
             )
 
     def llama_scorecard(self, prompt, prediction):
+        """
+        Formats and sends the prompt to the LLM for scoring.
+
+        Args:
+            prompt (str): Original task prompt or context.
+            prediction (str): Model-generated response.
+
+        Returns:
+            str: LLM-generated scorecard as a string.
+        """
         input_text = (
             LLM_JUDGE_TEMPLATE.format(
                 criteria=self.criteria_def,
@@ -402,6 +492,17 @@ class LLMJudgeLlama(LLMRougeLlama):
         return self._generate_response(input_text, max_new_tokens=self.max_new_tokens)
 
     def compute(self, prompts, predictions, labels):
+        """
+        Computes mean score per criterion over all prediction-prompt pairs.
+
+        Args:
+            prompts (List[str]): Input prompts.
+            predictions (List[str]): Model-generated outputs.
+            labels (unused): Not used, included for API compatibility.
+
+        Returns:
+            Dict[str, float]: Mean score per evaluation criterion.
+        """
         scores = []
 
         for p, pred in zip(prompts, predictions):

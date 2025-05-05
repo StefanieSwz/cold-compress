@@ -3,7 +3,6 @@ import time
 from typing import Optional, Tuple
 from pathlib import Path
 import argparse
-import wandb
 
 import torch
 import torch._dynamo.config
@@ -14,6 +13,8 @@ import yaml
 from model import Transformer, find_multiple
 from tokenizer import TokenizerInterface
 from cache_utils import load_trained_lightweight
+
+import wandb
 
 default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -515,20 +516,20 @@ def generate(
     t1 = time.perf_counter()
 
     # After prefilling
-    if wandb.run is not None:
-        relevant_layers = {0, 1, 12, 14, 26, 27}
-        for layer_idx, layer in enumerate(model.layers):
-            if layer_idx in relevant_layers:
-                if hasattr(layer.attention.prompt_compressor, "logged_scores"):
-                    for entry in layer.attention.prompt_compressor.logged_scores:
-                        table_prefill.add_data(
-                            True,
-                            entry["token_pos"],
-                            layer_idx,
-                            entry["head"],
-                            entry["input_pos"],
-                            entry["importance_score"],
-                        )
+    # if wandb.run is not None:
+    #     relevant_layers = {0, 1, 12, 14, 26, 27}
+    #     for layer_idx, layer in enumerate(model.layers):
+    #         if layer_idx in relevant_layers:
+    #             if hasattr(layer.attention.prompt_compressor, "logged_scores"):
+    #                 for entry in layer.attention.prompt_compressor.logged_scores:
+    #                     table_prefill.add_data(
+    #                         True,
+    #                         entry["token_pos"],
+    #                         layer_idx,
+    #                         entry["head"],
+    #                         entry["input_pos"],
+    #                         entry["importance_score"],
+    #                     )
 
     prefill_seconds = t1 - t0
 
@@ -555,27 +556,27 @@ def generate(
     total_seconds = t2 - t0
 
     # After decoding
-    if wandb.run is not None:
-        relevant_layers = {0, 1, 12, 14, 26, 27}
-        for layer_idx, layer in enumerate(model.layers):
-            if layer_idx in relevant_layers:
-                if hasattr(layer.attention.kv_cache, "logged_scores"):
-                    for entry in layer.attention.kv_cache.logged_scores:
-                        table_decode.add_data(
-                            False,
-                            entry["token_pos"],
-                            layer_idx,
-                            entry["head"],
-                            entry["input_pos"],
-                            entry["importance_score"],
-                        )
+    # if wandb.run is not None:
+    #     relevant_layers = {0, 1, 12, 14, 26, 27}
+    #     for layer_idx, layer in enumerate(model.layers):
+    #         if layer_idx in relevant_layers:
+    #             if hasattr(layer.attention.kv_cache, "logged_scores"):
+    #                 for entry in layer.attention.kv_cache.logged_scores:
+    #                     table_decode.add_data(
+    #                         False,
+    #                         entry["token_pos"],
+    #                         layer_idx,
+    #                         entry["head"],
+    #                         entry["input_pos"],
+    #                         entry["importance_score"],
+    #                     )
 
-        wandb.log(
-            {
-                "Importance Scores Prefill": table_prefill,
-                "Importance Scores Decode": table_decode,
-            }
-        )
+    #     wandb.log(
+    #         {
+    #             "Importance Scores Prefill": table_prefill,
+    #             "Importance Scores Decode": table_decode,
+    #         }
+    #     )
 
     prefill_tokens = prompt_length
     decode_tokens = (
@@ -661,7 +662,7 @@ def compile_funcs(compile=True):
         decode_one_token = torch.compile(
             decode_one_token,
             fullgraph=True,
-            # dynamic=True,
+            dynamic=True,
             mode="reduce-overhead",
             # options={"trace.graph_diagram": True, "trace.enabled": True}
         )

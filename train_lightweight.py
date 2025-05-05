@@ -30,10 +30,6 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
-# support running without installing as a package
-print("BEFORE anything:")
-print("torch.cuda.is_available():", torch.cuda.is_available())
-print("device count:", torch.cuda.device_count())
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.append(str(PROJECT_ROOT))
 
@@ -206,7 +202,12 @@ class PromptIterableDataset(IterableDataset):
 
 
 def add_train_arguments(parser: argparse.ArgumentParser):
-    # Generation hparams
+    """
+    Adds training-related command-line arguments to the parser.
+
+    Args:
+        parser (argparse.ArgumentParser): Argument parser object.
+    """
     parser.add_argument(
         "--checkpoint_path",
         type=Path,
@@ -247,11 +248,6 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         default=[
             "attn_score",
             "vector_norm",
-            # # "vector_cv",
-            # # "vector_z_score",
-            # "token_profiling",
-            # "convolution",
-            # "normalized_pos",
         ],
         choices=[
             "attn_score",
@@ -375,6 +371,21 @@ def add_train_arguments(parser: argparse.ArgumentParser):
 def prepare_dataset(
     tokenizer: nn.Module, args: argparse.Namespace
 ) -> Tuple[DataLoader, DataLoader]:
+    """
+    Loads and prepares the UltraChat dataset for training and validation.
+
+    Samples are randomly selected, tokenized using a prompt-aware dataset wrapper,
+    and split according to the train ratio. The resulting datasets are returned
+    as PyTorch DataLoaders.
+
+    Args:
+        tokenizer (nn.Module): Tokenizer used to tokenize the input samples.
+        args (argparse.Namespace): Arguments including dataset path, max sequence length,
+            train ratio, batch size, num samples, and random seed.
+
+    Returns:
+        Tuple[DataLoader, DataLoader]: Training and validation data loaders.
+    """
     # Load dataset
     ultrachat_datadic = load_dataset(args.dataset_path)
     len_ultrachat = len(ultrachat_datadic["train_gen"])  # full set
@@ -460,14 +471,11 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # Load model
-    print("CUDA available:", torch.cuda.is_available())
-    print("Current device:", torch.cuda.current_device())
     assert (
         torch.cuda.is_available()
     ), "CUDA not available — check container and job config."
     device = "cuda"
 
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device={device}")
     # distributed training
     rank = maybe_init_dist()

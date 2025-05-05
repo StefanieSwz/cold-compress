@@ -9,7 +9,6 @@ import argparse
 import itertools
 from datetime import datetime
 from task import TASK_MAPPING
-from pathlib import Path
 
 
 class GPUJobQueue:
@@ -168,14 +167,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_dir", default="eval_job_logs", help="Directory for job logs"
     )
+
     args = parser.parse_args()
 
     gpu_queue = GPUJobQueue(num_gpus=args.num_gpus, log_dir=args.log_dir)
 
     base_command = "python eval.py --task {task} --cache_strategy lightweight --prompt_compression_strategy lightweight --lightweight_model_version {version} --global_tokens 4 --recent_window 10 --num_samples {ns}  --max_cache_length {cs} --use_wandb"  # --compile
 
-    # Create tasks and add them to the task queue.
-    # tasks = list(itertools.product(args.tasks, args.cache_sizes, args.lightweight_model_versions))
     for task, cs, version in itertools.product(
         args.tasks, args.cache_sizes, args.lightweight_model_versions
     ):

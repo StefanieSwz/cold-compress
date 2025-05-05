@@ -768,7 +768,6 @@ class UltraChat(EvaluationTask):
     response as the target label.
 
     Attributes:
-        DEFAULT_PROMPT_TEMPLATE (str): The default prompt template with chat history and response markers.
         RAW_PROMPT_TEMPLATE (str): A raw prompt template for cases where only the chat history is needed.
         train_split (str): Dataset split used for training.
         validation_split (str): Dataset split used for validation.
@@ -845,10 +844,6 @@ class UltraChat(EvaluationTask):
             split_name = "train_gen"
         if not self.is_ready[split_name]:
             split_data = self.dataset[split_name].select(range(1, 2))
-            # if split == "test_gen":
-            #     split_data = split_data.select(
-            #         range(min(len(split_data), EVAL_LENGTH))
-            #     )  # Limit to EVAL_LENGTH rows for now in evaluation
 
             if split != "test_gen":  # Train-validation split logic
                 # TODO: Implement a proper train-validation split with seed and parameter setting
