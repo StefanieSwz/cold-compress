@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import torch._dynamo.config
 import torch._inductor.config
@@ -29,7 +30,6 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
 
-# support running without installing as a package
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.append(str(PROJECT_ROOT))
 
@@ -202,7 +202,12 @@ class PromptIterableDataset(IterableDataset):
 
 
 def add_train_arguments(parser: argparse.ArgumentParser):
-    # Generation hparams
+    """
+    Adds training-related command-line arguments to the parser.
+
+    Args:
+        parser (argparse.ArgumentParser): Argument parser object.
+    """
     parser.add_argument(
         "--checkpoint_path",
         type=Path,
@@ -243,11 +248,6 @@ def add_train_arguments(parser: argparse.ArgumentParser):
         default=[
             "attn_score",
             "vector_norm",
-            # # "vector_cv",
-            # # "vector_z_score",
-            # "token_profiling",
-            # "convolution",
-            # "normalized_pos",
         ],
         choices=[
             "attn_score",
@@ -307,8 +307,15 @@ def add_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=3e-5,  # 1e-3 -- e-6 --> see which gives best convergence
+        default=5e-3,  # 1e-3 -- e-6 --> see which gives best convergence
         help="Learning rate for training.",
+    )
+
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,  # 1e-3 -- e-6 --> see which gives best convergence
+        help="Weight decay for training.",
     )
 
     parser.add_argument(
@@ -364,6 +371,21 @@ def add_train_arguments(parser: argparse.ArgumentParser):
 def prepare_dataset(
     tokenizer: nn.Module, args: argparse.Namespace
 ) -> Tuple[DataLoader, DataLoader]:
+    """
+    Loads and prepares the UltraChat dataset for training and validation.
+
+    Samples are randomly selected, tokenized using a prompt-aware dataset wrapper,
+    and split according to the train ratio. The resulting datasets are returned
+    as PyTorch DataLoaders.
+
+    Args:
+        tokenizer (nn.Module): Tokenizer used to tokenize the input samples.
+        args (argparse.Namespace): Arguments including dataset path, max sequence length,
+            train ratio, batch size, num samples, and random seed.
+
+    Returns:
+        Tuple[DataLoader, DataLoader]: Training and validation data loaders.
+    """
     # Load dataset
     ultrachat_datadic = load_dataset(args.dataset_path)
     len_ultrachat = len(ultrachat_datadic["train_gen"])  # full set
@@ -449,7 +471,11 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # Load model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    assert (
+        torch.cuda.is_available()
+    ), "CUDA not available — check container and job config."
+    device = "cuda"
+
     print(f"Using device={device}")
     # distributed training
     rank = maybe_init_dist()
@@ -510,7 +536,19 @@ def main(args: argparse.Namespace) -> None:
     print(f"Total number of trainable parameters: {num_trainable_params:.2f}")
 
     # Optimizer
-    optimizer = AdamW(model.get_lightweight_params(), lr=args.learning_rate)
+    optimizer = AdamW(
+        model.get_lightweight_params(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",  # we want to minimize validation loss
+        factor=0.5,  # reduce LR by half
+        patience=1,  # wait 1 epochs before reducing LR
+        verbose=True,  # log when LR is reduced
+        min_lr=1e-6,  # prevent LR from getting too small
+    )
     loss = nn.CrossEntropyLoss(
         ignore_index=args.ignore_index, reduction="mean"
     )  # reduction is set to 'mean', thus the loss is automatically normalized by the number of tokens that are not ignored.
@@ -631,6 +669,7 @@ def main(args: argparse.Namespace) -> None:
                 reset_caches(model)
 
         avg_val_loss = total_val_loss / len(val_loader)
+        scheduler.step(avg_val_loss)
         print(f"Epoch {epoch + 1}: Average Validation Loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss})
 
@@ -677,11 +716,12 @@ def main(args: argparse.Namespace) -> None:
             "eval.py",
             "--tasks",
             "ultrachat",
-            "--use_wandb",
+            "--max_cache_length",
+            str(0.25),
+            "--num_samples",
+            str(50),
             "--checkpoint_path",
             str(args.checkpoint_path),
-            # "--compile",
-            # "--cache_length_pattern", args.cache_length_pattern," # default "tile"
             "--cache_strategy",
             "lightweight",
             "--cache_strategy_pattern",
@@ -689,21 +729,12 @@ def main(args: argparse.Namespace) -> None:
             "--prompt_compression_strategy",
             "lightweight",
             "--global_tokens",
-            str(args.global_tokens),
+            str(4),
             "--recent_window",
-            str(args.recent_window),
-            "--model_type",
-            str(args.model_type),
-            "--vector_convolution",
-            str(args.vector_convolution),
-            "--convolution_features",
-            *args.convolution_features,
-            "--feature_selection",
-            *args.feature_selection,
-            "--trained_weights",
-            "none",
+            str(10),
             "--lightweight_model_version",
             str(artifact_ref.version),
+            "--use_wandb",
         ]
         print(f"Executing evaluation script with arguments: {eval_command}")
         subprocess.run(eval_command)

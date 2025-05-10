@@ -1,11 +1,9 @@
 import math
-import operator
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Union
 import torch
 import torch.nn as nn
-import wandb
 
 
 def save_lightweight(model: nn.Module, kwargs: Dict[str, Any], identifier: str) -> Path:
@@ -152,78 +150,6 @@ def load_trained_lightweight(
     model.load_state_dict(model_state, strict=False)
 
     print(f"✅ Loaded trained weights for {model_key_substring} from {checkpoint_path}")
-
-
-def load_best_lightweight_model_wb(
-    model,  # nn.Module instance to update
-    entity,
-    project,
-    required_metadata,
-    metric_name="validation_loss",
-    load_kv=True,
-    higher_is_better=False,
-):
-    """
-    Searches the W&B registry for model artifacts matching the required metadata,
-    selects the best one based on the given metric, downloads it, and loads its
-    weights into the provided model using load_trained_lightweight.
-
-    Parameters:
-      - model (nn.Module): The model to load weights into.
-      - entity (str): W&B username or team.
-      - project (str): W&B project name.
-      - required_metadata (dict): Key/value pairs that must be present in the artifact's metadata.
-      - metric_name (str): Metric key to compare (default "validation_loss").
-      - load_kv (bool): Passed to load_trained_lightweight to select which weights to load.
-      - higher_is_better (bool): If True, higher metric is better; otherwise, lower is better.
-
-    Returns:
-      The model updated with the best artifact's weights (or the result of load_model_fn).
-
-    Raises:
-      Exception if no matching artifact is found.
-    """
-    api = wandb.Api()
-    runs = api.runs(path=f"{entity}/{project}")
-
-    best_artifact = None
-    best_metric = float("-inf") if higher_is_better else float("inf")
-    compare_op = operator.gt if higher_is_better else operator.lt
-
-    for run in runs:
-        try:
-            for artifact in run.logged_artifacts():
-                if artifact.type != "model":
-                    continue
-                meta = artifact.metadata or {}
-                # Skip if any required metadata key is missing or mismatched.
-                if not all(
-                    meta.get(key) == value for key, value in required_metadata.items()
-                ):
-                    continue
-                if metric_name not in meta:
-                    continue
-                metric_value = meta[metric_name]
-                if compare_op(metric_value, best_metric):
-                    best_metric = metric_value
-                    best_artifact = artifact
-        except wandb.errors.CommError as e:
-            print(f"Error accessing artifacts for run {run.id}: {e}")
-        except Exception as e:
-            print(f"Unexpected error accessing artifacts for run {run.id}: {e}")
-
-    if best_artifact is None:
-        raise Exception("No matching artifact found in the registry.")
-
-    print(f"Best model found: {best_artifact.name} with {metric_name} = {best_metric}")
-
-    # Download the artifact to a temporary directory
-    with tempfile.TemporaryDirectory() as artifact_dir:
-        artifact.download(root=artifact_dir)
-
-        checkpoint_path = Path(artifact_dir) / "model.pth"
-        load_trained_lightweight(model, checkpoint_path, load_kv=load_kv)
-        print(f"Loaded weights from {checkpoint_path} into model.")
 
 
 def prime_factors(n):

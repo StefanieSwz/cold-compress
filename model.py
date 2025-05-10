@@ -14,7 +14,10 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
-from attention_utils import scaled_dot_product_attention
+from attention_utils import (
+    scaled_dot_product_attention,
+    scaled_dot_product_attention_biased,
+)
 from cache import get_cache_constructor, KVCacheLightweight
 from prompt_compression import get_prompt_compressor_constructor
 
@@ -343,7 +346,6 @@ class Transformer(nn.Module):
         assert self.freqs_cis is not None, "Caches must be initialized first"
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
-        # TODO: convolution over embedding only once here, so to speak first layer only method
 
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -412,6 +414,12 @@ class Attention(nn.Module):
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
         self.train_mode = False
+
+        self.normalization = False
+        self.use_softmax = True
+        self.use_value_scoring = False
+        self.use_attention_bias = True
+
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -443,7 +451,7 @@ class Attention(nn.Module):
 
         kv_size = self.n_local_heads * self.head_dim
 
-        # x of shape (batch_size, 1, hidden_dim) in decoding mode, (batch_size, seqlen, hidden_dim) in prefill mode
+        # x [B, 1, model_dim] in decode, [B, T, model_dim] in prefill
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
@@ -453,10 +461,11 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        # shape: [bsz, n_local_heads, seqlen, head_dim] in prefill mode, (batch_size, n_local_heads, 1, head_dim) in decoding mode
+        q = q.transpose(
+            1, 2
+        )  # [B, query_heads, T, D] in prefill, [B, query_heads, 1, D] in decoding
+        k = k.transpose(1, 2)  # [B, H, T, D] in prefill, [B, H, 1, D] in decoding
+        v = v.transpose(1, 2)  # [B, H, T, D] in prefill, [B, H, 1, D] in decoding
 
         kv_mask = None
         cache_kwargs = {"input_ids": input_ids, "x": x, "query": q}
@@ -504,7 +513,7 @@ class Attention(nn.Module):
                     )
             input_pos, k, v, attn = self.compress_prompt(
                 input_pos, k, v, attn, **cache_kwargs
-            )
+            )  # attn already transformed for scoring
             with torch.no_grad():
                 self.kv_cache.update_kv(input_pos, k, v, is_prefill, **cache_kwargs)
 
@@ -512,40 +521,97 @@ class Attention(nn.Module):
         # This is a no-op for most cache classes
         self.kv_cache.update_state(input_pos, k, v, is_prefill, attn, **cache_kwargs)
 
-        # Call lightweight models to scale KV pairs
+        # Compute output with continuous relaxation of KV eviction for training Lightweight
         if (
             self.train_mode
             and is_prefill
             and isinstance(self.kv_cache, KVCacheLightweight)
         ):
             # Compute scores using KVCacheLightweight
-            scores = self.kv_cache._token_importances(  # pylint: disable=W0212
+            raw_scores = self.kv_cache._token_importances(  # pylint: disable=W0212
                 input_pos
-            )  # try normalizing the scores
-            # Scale keys and values using the scores
-            # TODO: Implement entropy control of factors
-            scaling_factors = torch.sigmoid(scores).unsqueeze(
-                -1
-            )  # Shape: [n_heads, seq_len, 1]
-            # TODO: Try out different settings with key and / or value scaling
-            # k = k * scaling_factors
-            scaling_factors = scaling_factors[:, : v.size(2), :]
-            scaling_factors = scaling_factors.unsqueeze(0).expand_as(v[:, :, :, :1])
-
-            v_scaled = v * scaling_factors
-
-            # k_rep = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-            v_rep = v_scaled.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-
-            y, attn = scaled_dot_product_attention(
-                q,
-                k_rep,
-                v_rep,
-                attn_mask=kv_mask if mask is None else mask,
-                dropout_p=0.0,
-                attn_top_k=attn_top_k,
-                return_attn=self.kv_cache.return_attn(),
             )
+            raw_scores = raw_scores[:, :seqlen]
+
+            if self.normalization:
+                invalid_mask = torch.isinf(raw_scores)
+                min_val = (
+                    torch.where(invalid_mask, float("inf"), raw_scores)
+                    .min(dim=-1, keepdim=True)
+                    .values
+                )
+                max_val = (
+                    torch.where(invalid_mask, float("-inf"), raw_scores)
+                    .max(dim=-1, keepdim=True)
+                    .values
+                )
+
+                # Fill infs with 0 after computing min/max
+                raw_scores = raw_scores.masked_fill(invalid_mask, 0.0)
+
+                # Normalize
+                raw_scores = (raw_scores - min_val) / (max_val - min_val).clamp(
+                    min=1e-4
+                ) * 10 - 5
+
+            if self.use_softmax:
+                temperature = 0.7
+                scores = F.softmax(raw_scores / temperature, dim=-1).unsqueeze(-1)
+            else:
+                scores = torch.sigmoid(raw_scores).unsqueeze(-1)  # [H, T, 1]
+
+            if self.use_value_scoring:
+                # For value scaling — only needs to match [B, H, T, 1]
+                scaling_factors = scores.unsqueeze(0).expand_as(v[:, :, :, :1])
+
+            if self.use_attention_bias:
+                # For attention bias — repeat scores per row and then repeat for query head
+                # scores: [H, T, 1]
+                scores = scores.squeeze(-1)
+                importance_scores = torch.tril(
+                    scores.unsqueeze(1).repeat(1, scores.size(1), 1)
+                )  # [H, T, T]
+                importance_scores = importance_scores / (
+                    importance_scores.sum(dim=2, keepdim=True) + 1e-8
+                )
+                importance_scores = importance_scores.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=0
+                ).unsqueeze(
+                    0
+                )  # [1, n_query_heads, T, T]
+
+            if self.use_value_scoring:
+                v_scaled = v * torch.where(
+                    scaling_factors < 1.0,
+                    scaling_factors,
+                    torch.ones_like(scaling_factors),
+                )
+
+                v_rep = v_scaled.repeat_interleave(
+                    self.n_head // self.n_local_heads, dim=1
+                )
+
+            if self.use_attention_bias:
+                y, attn = scaled_dot_product_attention_biased(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    return_attn=self.kv_cache.return_attn(),
+                    importance_scores=importance_scores,
+                )
+            else:
+                y, attn = scaled_dot_product_attention(
+                    q,
+                    k_rep,
+                    v_rep,
+                    attn_mask=kv_mask if mask is None else mask,
+                    dropout_p=0.0,
+                    attn_top_k=attn_top_k,
+                    return_attn=self.kv_cache.return_attn(),
+                )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
